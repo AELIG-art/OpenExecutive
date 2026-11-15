@@ -159,12 +159,16 @@ def list_live_alerts(
     *,
     now: datetime | None = None,
     viewer: object | None = None,
+    chat_reader: int | None = None,
 ) -> list[Alert]:
     """``unread`` alerts that are still live: not past TTL, not snoozed.
 
     A drafted artifact is its owner's alone (``models.visible_alert``): it is
     kept only for the ``viewer`` it belongs to, and left out with no viewer —
     the board the review, the reflection and the shared digests read.
+    A card from one person's own chat (``alerts.own_chat``) is kept for
+    that person and its approver alone, and left out with no viewer unless
+    ``chat_reader`` names whose build this is (the principal's own brief).
 
     Newest first, like ``store.list_alerts``. This is the read every
     user-facing surface shares; the sweep merely persists what this view
@@ -178,11 +182,14 @@ def list_live_alerts(
     # sweeps) freshly-expired rows are interleaved with live ones, so a
     # `limit`-sized page could come back short.
     rows = list_alerts(status="unread", limit=max(limit * 3, limit + 50), db_path=db_path)
+    from openexecutive.alerts import own_chat
+
+    own = own_chat.readers(rows)
     live = [
         a for a in rows
         if not is_expired(a, now, monitoring_days=monitoring_days, action_days=action_days)
         and not _is_snoozed(a, now)
-        and visible_alert(a, viewer)
+        and visible_alert(a, viewer, chat_reader=chat_reader, own_chat_readers=own)
     ]
     return live[:limit]
 

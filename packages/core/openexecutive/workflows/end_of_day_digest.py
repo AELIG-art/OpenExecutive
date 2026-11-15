@@ -548,7 +548,10 @@ class EndOfDayDigestWorkflow(Workflow):
         mode = effective_workspace_mode(current_session.get())
 
         try:
-            today_response = today_route._build_today()
+            today_response = today_route._build_today(
+                # The principal's own chat cards only on their own delivery.
+                chat_reader=today_route.principal_id() if _delivered_to_principal() else None,
+            )
             today_data = today_response.model_dump()
             # Same exclusion as the morning brief: monitoring noise is not
             # "still pending" — it lives in the Monitoring lane on /today.
@@ -690,10 +693,10 @@ class EndOfDayDigestWorkflow(Workflow):
         )
 
         from openexecutive.briefing.narrative import brief_model, create_brief_text
-        from openexecutive.memory.facts import with_standing_facts
+        from openexecutive.memory.facts import brief_reader, with_standing_facts
 
         # A SQLite read: off the event loop the SSE streams share.
-        user_content = await asyncio.to_thread(with_standing_facts, _render_eod_context(
+        user_content = await asyncio.to_thread(with_standing_facts, reader=brief_reader(), user_content=_render_eod_context(
             period_label=period, today_data=today_data, activity=activity,
             since=since, handled=handled, mode=mode, owner_notes=owner_notes.text,
             conversation=conversation, live_lines=live_lines, coming_up=coming_up,
