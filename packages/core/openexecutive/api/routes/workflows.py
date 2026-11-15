@@ -16,6 +16,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -352,10 +353,50 @@ def _keeps_approvals(name: str, request: Request) -> bool:
     return kept_on_edit_by(name, editor)
 
 
+def _delete_rule(request: Request) -> Callable[[int | None], bool]:
+    """The delete rule for this caller, with the caller looked up once: given
+    a workflow's creator, whether the caller may delete it. The person who
+    created it may, and so may the principal. One with no recorded creator is
+    the principal's to delete, and an install with no principal yet is never
+    locked out (``chat._caller_is_principal_or_unclaimed``). Workflows stay
+    shared for editing and running; one teammate doesn't remove another's.
+    Fails closed."""
+    from openexecutive.api.routes.chat import (
+        _caller_is_principal_or_unclaimed,
+        _resolve_caller_person_id,
+    )
+
+    if _caller_is_principal_or_unclaimed(request):
+        return lambda _owner: True
+    try:
+        caller = _resolve_caller_person_id(request)
+    except Exception:
+        logger.exception("workflows: caller lookup failed, delete refused")
+        caller = None
+    return lambda owner: caller is not None and owner is not None and caller == owner
+
+
+def _may_delete(name: str, request: Request) -> bool:
+    """Whether the caller may delete the custom workflow ``name``
+    (``_delete_rule``). Fails closed."""
+    rule = _delete_rule(request)
+    try:
+        return rule(get_owner(name))
+    except Exception:
+        logger.exception("workflows: creator lookup failed, delete refused")
+        return False
+
+
 @router.get("/workflows/custom")
-async def list_custom_workflows() -> dict[str, Any]:
-    """All dynamic definitions (active and inactive) for the builder UI."""
-    return {"definitions": [_with_owner(d) for d in list_definitions(active_only=False)]}
+async def list_custom_workflows(request: Request) -> dict[str, Any]:
+    """All dynamic definitions (active and inactive) for the builder UI, each
+    with ``can_delete`` for this caller (``_delete_rule``)."""
+    rule = _delete_rule(request)
+    definitions = []
+    for d in list_definitions(active_only=False):
+        row = _with_owner(d)
+        definitions.append({**row, "can_delete": rule(row["owner_person_id"])})
+    return {"definitions": definitions}
 
 
 @router.post("/workflows/custom", status_code=201)
@@ -417,9 +458,16 @@ async def update_custom_workflow(name: str, request: Request) -> dict[str, Any]:
 
 
 @router.delete("/workflows/custom/{name}")
-async def delete_custom_workflow(name: str) -> dict[str, str]:
+async def delete_custom_workflow(name: str, request: Request) -> dict[str, str]:
     from openexecutive.workflows.dynamic_cadence import cancel_cadence_rows
 
+    if get_definition(name) is None:
+        raise HTTPException(status_code=404, detail=f"Custom workflow {name!r} not found")
+    if not _may_delete(name, request):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the person who created this workflow or the principal can delete it.",
+        )
     cancel_cadence_rows(name)
     if not delete_definition(name):
         raise HTTPException(status_code=404, detail=f"Custom workflow {name!r} not found")
