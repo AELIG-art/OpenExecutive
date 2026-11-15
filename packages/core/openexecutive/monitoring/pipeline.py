@@ -454,8 +454,14 @@ def _digest_signal(item: WatchlistItem, held: list[dict]) -> tuple[Signal, dict 
             if url and url not in seen:
                 seen.add(url)
                 links.append(link)
-        if not payload.get("new_links") and payload.get("added_text"):
-            texts.append(str(payload["added_text"])[:300])
+        if payload.get("new_links"):
+            continue
+        changes = str(payload.get("changes") or "")
+        if any(not line.startswith("added ") for line in changes.splitlines()):
+            # Both sides of a rewrite (page_watch._diff).
+            texts.append("changes: " + changes.replace("\n", "; ")[:300])
+        elif payload.get("added_text"):
+            texts.append("new text: " + str(payload["added_text"])[:300])
     worst = max(
         (AlertSeverity(row.get("severity_hint") or "low") for row in held),
         key=lambda sev: SEVERITY_RANK[sev.value],
@@ -467,7 +473,9 @@ def _digest_signal(item: WatchlistItem, held: list[dict]) -> tuple[Signal, dict 
         more = len(links) - 3
         detail = f"new: {titles}" + (f" (+{more} more)" if more > 0 else "")
     else:
-        detail = "new text: " + (_without_links(texts[0])[:160] if texts else "see the page")
+        # A rewrite says more than an addition, whichever row came last.
+        pick = next((t for t in texts if t.startswith("changes: ")), texts[0] if texts else "")
+        detail = _without_links(pick)[:180] if pick else "new text: see the page"
     summary = f"[{label}] {len(held)} changes since {first_seen} — {detail}"
     readable = "\n".join(
         f"- {_without_links(str(link.get('text') or ''))} ({_safe_url(str(link.get('url') or ''))})"
