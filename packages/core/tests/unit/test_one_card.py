@@ -243,3 +243,148 @@ def test_open_cards_from_lists_earlier_turns_only() -> None:
     finally:
         current_session.reset(token)
     assert json.dumps(one_card.open_cards_from("", turn="x", reader=owners)) == "[]"
+
+
+def test_a_reply_the_mailbox_filed_as_a_new_thread_is_the_same_conversation(mail_turn: Session) -> None:
+    one_card.note_mail("thread-1", "dana@northpeak.example", "Pallet labels for January")
+    assert one_card.continues("thread-9", "dana@northpeak.example", "Re: Pallet labels for January")
+    assert not one_card.continues("thread-7", "dana@northpeak.example", "Pallet labels for January")
+    one_card.note_mail("thread-9", "dana@northpeak.example", "Re: Pallet labels for January", proven=True)
+    one_card.note_mail("thread-7", "dana@northpeak.example", "Pallet labels for January", proven=True)  # a new ask
+    one_card.note_mail("thread-8", "leo@northpeak.example", "Re: Pallet labels for January", proven=True)
+    # A From: line the mailbox didn't vouch for starts its own thread.
+    one_card.note_mail("thread-6", "dana@northpeak.example", "Re: Pallet labels for January")
+    reply = {"to": "dana@northpeak.example", "subject": "Re: Pallet labels for January", "body": "x"}
+    with set_turn(session_id="s", turn_id="turn-1"):
+        old_card, old = _approve(tool_input={**reply, "thread_id": "thread-1"})
+    mail_turn.email_thread_id = "thread-9"
+    with set_turn(session_id="s", turn_id="turn-2"):
+        bump = _note("Dana is following up on the labels")
+        new_card, new = _approve(tool_input={**reply, "thread_id": "thread-9", "body": "y"})
+    # The follow-up joined the waiting card, and moved with it to the newer reply.
+    assert _get(bump).superseded_by_alert_id == new_card
+    assert "Dana is following up on the labels" in _get(new_card).body
+    assert ledger.get_decision_instance(old).status == ledger.STATUS_CLOSED_EXTERNALLY  # type: ignore[union-attr]
+    assert _get(new_card).status == "unread"
+    # The same subject written fresh, or from someone else, is its own matter.
+    for thread, sender in (
+        ("thread-7", "dana@northpeak.example"), ("thread-8", "leo@northpeak.example"),
+        ("thread-6", "dana@northpeak.example"),
+    ):
+        mail_turn.email_thread_id, mail_turn.email_from = thread, sender
+        with set_turn(session_id="s", turn_id=f"turn-{thread}"):
+            assert _get(_note(f"From {thread}")).status == "unread"
+
+
+def test_a_follow_up_joins_the_senders_latest_conversation_on_that_subject() -> None:
+    one_card.note_mail("t-1", "dana@northpeak.example", "Labels")
+    one_card.note_mail("t-7", "dana@northpeak.example", "Labels")
+    one_card.note_mail("t-9", "dana@northpeak.example", "RE: labels", proven=True)
+    one_card.note_mail("t-9", "dana@northpeak.example", "Something else", proven=True)  # noted once
+    one_card.note_mail("", "dana@northpeak.example", "Re: Labels", proven=True)
+    one_card.note_mail("t-5", "", "Re: Labels", proven=True)
+    import sqlite3
+
+    with sqlite3.connect(alerts_store.DB_PATH) as conn:
+        rows = dict(conn.execute("SELECT thread_id, conversation FROM mail_conversations").fetchall())
+    assert rows == {"t-1": "t-1", "t-7": "t-7", "t-9": "t-7"}
+
+
+def test_a_replaced_card_hands_its_graver_joined_card_to_the_newer_one(mail_turn: Session) -> None:
+    reply = {"to": "dana@northpeak.example", "subject": "Re: Thursday", "body": "x", "thread_id": "thread-1"}
+    with set_turn(session_id="s", turn_id="turn-1"):
+        old_card, _ = _approve(tool_input=reply)
+        _note("These bank details look changed", severity="high")
+    with set_turn(session_id="s", turn_id="turn-2"):
+        new_card, _ = _approve(tool_input={**reply, "body": "y"})
+    kept = _get(new_card)
+    assert _get(old_card).status == "dismissed"
+    assert kept.severity == "high" and "These bank details look changed" in kept.body
+
+
+def test_the_subject_a_follow_up_is_matched_on_comes_from_the_header() -> None:
+    from openexecutive.integrations.email_poller import _header_subject
+
+    assert _header_subject("From: dana@x.example\nSUBJECT: Re: Labels\n\nSubject: not this") == "Re: Labels"
+    assert _header_subject("From: dana@x.example\n\nSubject: in the body") == ""
+
+
+def test_a_forward_on_the_same_subject_starts_its_own_conversation() -> None:
+    one_card.note_mail("t-1", "dana@northpeak.example", "Pallet labels")
+    assert not one_card.continues("t-2", "dana@northpeak.example", "Fwd: Pallet labels")
+    assert one_card.continues("t-2", "dana@northpeak.example", "AW: Pallet labels")
+
+
+def test_a_reply_waits_on_the_card_of_the_conversation_its_thread_joined(mail_turn: Session) -> None:
+    one_card.note_mail("thread-1", "dana@northpeak.example", "Thursday")
+    one_card.note_mail("thread-9", "dana@northpeak.example", "Re: Thursday", proven=True)
+    reply = {"to": "dana@northpeak.example", "subject": "Re: Thursday", "body": "x", "thread_id": "thread-1"}
+    _approve(tool_input=reply)
+    thread, step = one_card.held_topic("google_workspace__send_gmail_message", [reply], mcp=True)
+    owner = one_card.reader_for(OWNER, private=False)
+    assert one_card.approve_waiting("mail:thread-9", reader=owner, step=step)
+    assert not one_card.approve_waiting("mail:thread-5", reader=owner, step=step)
+
+
+def test_each_newer_reply_takes_everything_the_one_it_replaced_held(mail_turn: Session) -> None:
+    reply = {"to": "dana@northpeak.example", "subject": "Re: Thursday", "body": "a", "thread_id": "thread-1"}
+    with set_turn(session_id="s", turn_id="turn-a"):
+        a, _ = _approve(tool_input=reply)
+        first = _note("Dana asked for Thursday", severity="high")
+    with set_turn(session_id="s", turn_id="turn-b"):
+        b, _ = _approve(tool_input={**reply, "body": "b"})
+        second = _note("Dana asked again")
+    with set_turn(session_id="s", turn_id="turn-c"):
+        c, _ = _approve(tool_input={**reply, "body": "c"})
+    kept = _get(c)
+    assert _get(a).status == _get(b).status == "dismissed"
+    assert kept.severity == "high"
+    assert "Dana asked for Thursday" in kept.body and "Dana asked again" in kept.body
+    assert _get(first).superseded_by_alert_id == _get(second).superseded_by_alert_id == c
+
+
+def test_the_poller_links_a_follow_up_only_for_a_sender_the_mailbox_vouched_for() -> None:
+    import asyncio
+
+    from openexecutive.integrations.email_poller import _note_thread
+
+    calls: list[str] = []
+
+    def prover(result: bool | None) -> Any:
+        async def prove() -> bool:
+            calls.append("prove")
+            if result is None:
+                raise RuntimeError("mailbox down")
+            return result
+        return prove
+
+    dana = "dana@northpeak.example"
+    asyncio.run(_note_thread("t-1", dana, "Labels", prover(True)))
+    assert calls == []  # a fresh mail is never proven: it links to nothing
+    asyncio.run(_note_thread("t-2", dana, "Re: Labels", prover(False)))
+    asyncio.run(_note_thread("t-3", dana, "Re: Labels", prover(None)))
+    asyncio.run(_note_thread("t-4", dana, "Re: Labels", prover(True)))
+    assert calls == ["prove", "prove", "prove"]
+    import sqlite3
+
+    with sqlite3.connect(alerts_store.DB_PATH) as conn:
+        rows = dict(conn.execute("SELECT thread_id, conversation FROM mail_conversations").fetchall())
+    # Unproven (t-2) and unprovable (t-3) follow-ups keep their own thread;
+    # the vouched one (t-4) joins the latest conversation on that subject.
+    assert rows == {"t-1": "t-1", "t-2": "t-2", "t-3": "t-3", "t-4": "t-3"}
+
+
+def test_a_newer_reply_takes_each_follow_up_once_and_stays_within_the_cap(mail_turn: Session) -> None:
+    from openexecutive.alerts.store import _FOLLOW_UP_MAX
+
+    reply = {"to": "dana@northpeak.example", "subject": "Re: Thursday", "body": "a", "thread_id": "thread-1"}
+    with set_turn(session_id="s", turn_id="turn-a"):
+        a, _ = _approve(tool_input=reply)
+        _note("Dana asked for Thursday")
+        _note("x" * _FOLLOW_UP_MAX)
+    with set_turn(session_id="s", turn_id="turn-b"):
+        b, _ = _approve(tool_input={**reply, "body": "b"})
+    body = _get(b).body
+    assert len(body) <= _FOLLOW_UP_MAX
+    follow_ups = body.split("\n\nThen: ")[1:]
+    assert follow_ups and len(follow_ups) == len(set(follow_ups))
