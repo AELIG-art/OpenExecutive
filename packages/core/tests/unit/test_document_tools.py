@@ -134,8 +134,38 @@ async def test_long_text_is_capped(dirs, monkeypatch) -> None:
 
     out = await handle_read_document({"path": str(downloads / "long.txt")})
 
-    assert "[truncated — pass `pages` to read the rest]" in out
-    assert len(out) < 1200
+    # The part leaves room for the note, so the turn's own cap never cuts it.
+    assert len(out) <= 1000
+    assert "call again with start=" in out
+
+
+async def test_a_long_word_file_is_read_on_in_parts(dirs, monkeypatch) -> None:
+    # A long file of any kind, not only a PDF, reads on from where the last
+    # part was cut off, so its end never needs a Python job.
+    import re
+
+    monkeypatch.setenv("TOOL_RESULT_MAX_CHARS", "1000")
+    downloads, _ = dirs
+    text = "".join(f"line {i:04d}\n" for i in range(500))
+    (downloads / "psa.txt").write_text(text)
+
+    read, start = "", 0
+    for _ in range(20):
+        out = await handle_read_document({"path": str(downloads / "psa.txt"), "start": start})
+        body = out.split("\n", 1)[1]
+        body = re.sub(r"^…\[from character \d+ of \d+\]\n", "", body)
+        cut = re.search(r"\n…\[cut off at character (\d+) of \d+ — call again with start=(\d+) to read on\]$", body)
+        if cut is None:
+            read += body
+            break
+        read += body[: cut.start()]
+        start = int(cut.group(2))
+    assert read == text
+
+    past = await handle_read_document({"path": str(downloads / "psa.txt"), "start": len(text)})
+    assert _error(past) == f"that file has only {len(text)} characters"
+    bad = await handle_read_document({"path": str(downloads / "psa.txt"), "start": -1})
+    assert "start must be" in _error(bad)
 
 
 def test_is_registered_on_the_executive_and_withheld_on_private_turns() -> None:
@@ -149,3 +179,27 @@ def test_is_registered_on_the_executive_and_withheld_on_private_turns() -> None:
     assert executive._ALL_SKILL_HANDLERS["read_document"] is handle_read_document
     assert "read_document" in PRIVATE_TURN_WITHHELD_TOOLS
     assert private_turn_withholds("read_document", {"path": "/x"})
+
+
+async def test_a_long_page_range_reads_on_with_the_same_pages(dirs, monkeypatch) -> None:
+    # ``start`` counts into the pages read, so the note names them again.
+    import io
+
+    from pypdf import PdfWriter
+
+    async def fake_read(data: bytes | Path, *, filename: str = "", inbound: bool = False) -> pdf_reader.PdfReadResult:
+        return pdf_reader.PdfReadResult("y" * 5000, "text", 0)
+
+    monkeypatch.setattr(pdf_reader, "read_pdf_text", fake_read)
+    monkeypatch.setenv("TOOL_RESULT_MAX_CHARS", "1000")
+    writer = PdfWriter()
+    for _ in range(30):
+        writer.add_blank_page(width=612, height=792)
+    buf = io.BytesIO()
+    writer.write(buf)
+    downloads, _ = dirs
+    (downloads / "deck.pdf").write_bytes(buf.getvalue())
+
+    out = await handle_read_document({"path": str(downloads / "deck.pdf"), "pages": "11-20"})
+
+    assert "call again with pages='11-20' and start=" in out
