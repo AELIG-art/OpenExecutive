@@ -140,7 +140,7 @@ def render_notes(notes: list[Any]) -> str:
         where = clean(note.channel, 40)
         line = f"[{note.occurred_at[:10]}] {where}, with {who}: " if who else f"[{note.occurred_at[:10]}] {where}: "
         if note.correction:
-            line += f"{clean(note.correction, 400)} (as you corrected it)"
+            line += f"{clean(note.corrected, 400)} (as you corrected it)"
         else:
             # Their own words first; the summary is only how it was noted.
             line += f'your words: "{clean(note.quote, 400)}" (noted as: {clean(note.summary, 400)})'
