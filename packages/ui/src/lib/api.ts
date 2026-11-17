@@ -1,3 +1,4 @@
+import { cardDetail, cardDetails, type CardDetail } from "@/lib/cardDetails";
 import type { AlertApproval } from "@/lib/approvals";
 import type { AnswerSources } from "@/lib/answerSources";
 import type { DirectoryListing, DirectoryOption } from "@/lib/chatDirectory";
@@ -7372,6 +7373,10 @@ export interface LeadCardField {
   label: string;
   long: boolean;
   value: string;
+  // A Drive file shown by its name links to it; a sheet's rows draw as a table.
+  href?: string;
+  table?: string[][];
+  header?: boolean;
 }
 
 // What a Take the lead card holds (its decision's payload), for the card's
@@ -7394,14 +7399,26 @@ export interface LeadCardPayload {
 // each is {field: "To", value}, the field being its label. Older cards kept
 // {field, label, long}. Either way the card shows the label, and a message
 // (or anything long) as a block.
-function leadDetail(d: { field?: unknown; label?: unknown; long?: unknown; value?: unknown }): LeadCardField {
-  const value = String(d.value ?? "");
+function leadDetail(d: {
+  field?: unknown;
+  label?: unknown;
+  long?: unknown;
+  value?: unknown;
+  href?: unknown;
+  table?: unknown;
+  header?: unknown;
+}): LeadCardField {
+  const { value, href, table, header } = cardDetail(d);
   const label = String(d.label ?? d.field ?? "");
   return {
     field: String(d.field ?? label),
     label,
-    long: typeof d.long === "boolean" ? d.long : /^message$/i.test(label) || value.includes("\n") || value.length > 120,
+    long: table
+      ? true
+      : typeof d.long === "boolean" ? d.long : /^message$/i.test(label) || value.includes("\n") || value.length > 120,
     value,
+    ...(href ? { href } : {}),
+    ...(table ? { table, header } : {}),
   };
 }
 
@@ -7429,7 +7446,7 @@ export interface HeldActionPayload {
   summary: string;
   reason: string;
   requestedBy: string;
-  details: { field: string; value: string }[];
+  details: CardDetail[];
   // What Edit may change before Approve (an email's subject and text).
   fields: LeadCardField[];
 }
@@ -7444,10 +7461,7 @@ export async function getHeldAction(id: number, signal?: AbortSignal): Promise<H
     summary: String(payload.summary ?? ""),
     reason: String(payload.reason ?? ""),
     requestedBy: String(payload.requested_by ?? ""),
-    details: details.map((d: { field?: unknown; value?: unknown }) => ({
-      field: String(d.field ?? ""),
-      value: String(d.value ?? ""),
-    })),
+    details: cardDetails(details),
     fields: (Array.isArray(payload.fields) ? payload.fields : []).filter(
       (f: { field?: unknown; value?: unknown }) => typeof f?.field === "string" && typeof f?.value === "string",
     ),
