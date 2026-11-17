@@ -807,6 +807,36 @@ def test_their_own_reply_closes_the_card_and_keeps_the_draft(owner: Any, models:
     assert "d1" in mailbox.drafts
 
 
+def test_a_reply_on_a_joined_thread_doesnt_answer_the_card(
+    owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.delegation import answers, card_work
+
+    mailbox, card = _one_card(owner, models)
+    payload = inbox.card_payload(ledger.get_decision_instance(card.id))
+    joined_at = (NOW - timedelta(minutes=20)).isoformat()
+    assert ledger.update_open_payload(card.id, {
+        **payload, card_work.JOINED_KEY: ["t2"], card_work.JOINED_AT_KEY: {"t2": joined_at},
+    })
+    mailbox.add(_msg("j1", "t2", minutes_ago=20, text="Here is the list."))
+    # Their "thanks, got it" to the email that joined: the card's ask is still open.
+    mailbox.add(_msg("r2", "t2", sender=OWNER, labels=("SENT",), minutes_ago=-5, text="Thanks, got it."))
+    caught: list[list[str]] = []
+
+    async def catch_up(person: Any, row: Any, p: Any, newer: list[Any], **_k: Any) -> bool:
+        caught.append([m.id for m in newer])
+        return True
+
+    monkeypatch.setattr(answers, "catch_up", catch_up)
+    _reconcile(owner, mailbox)
+    assert ledger.get_decision_instance(card.id).status == "proposed"  # type: ignore[union-attr]
+    # Newer mail from them there still brings the card up to date.
+    mailbox.add(_msg("j2", "t2", minutes_ago=-10, text="One more: the Road Runner."))
+    _reconcile(owner, mailbox)
+    assert ledger.get_decision_instance(card.id).status == "proposed"  # type: ignore[union-attr]
+    assert caught and caught[-1] == ["j2"]
+
+
 def test_a_week_old_card_expires_and_keeps_the_draft(owner: Any, models: dict[str, Any]) -> None:
     mailbox, card = _one_card(owner, models)
     assert _reconcile(owner, mailbox, now=datetime.now(UTC) + timedelta(days=8)) == 1
@@ -1326,6 +1356,23 @@ def test_reply_from_home_drafts_what_the_watcher_passed_over(
     assert _ledger(db)["m1"][0] == "drafted"
     # Asked again: the same card, no second draft.
     assert _ask(owner, mailbox, "t1", "m1") == card.id and len(mailbox.specs) == 1
+
+
+def test_reply_from_home_on_a_joined_email_finds_its_card(owner: Any, models: dict[str, Any]) -> None:
+    from openexecutive.delegation import card_work
+
+    mailbox, card = _one_card(owner, models)
+    payload = inbox.card_payload(ledger.get_decision_instance(card.id))
+    assert ledger.update_open_payload(card.id, {
+        **payload, card_work.JOINED_KEY: ["t2"], card_work.JOINED_AT_KEY: {"t2": NOW.isoformat()},
+    })
+    mailbox.add(_msg("j1", "t2", minutes_ago=20, text="Here is the list."))
+    specs = len(mailbox.specs)
+    # Reply on the email that joined the card: the same card, no second one.
+    assert _ask(owner, mailbox, "t2", "j1") == card.id
+    assert [c.id for c in inbox.open_cards(owner.id)] == [card.id] and len(mailbox.specs) == specs
+    assert inbox.card_on_thread(inbox.open_cards(owner.id), "t2").id == card.id  # type: ignore[union-attr]
+    assert "t2" in inbox.card_threads(inbox.open_cards(owner.id))
 
 
 def test_reply_from_home_reuses_the_card_on_the_conversation(owner: Any, models: dict[str, Any]) -> None:
