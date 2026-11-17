@@ -79,17 +79,19 @@ def speaker(session: Any) -> Person | None:
 
 
 
-def _headline(person: Any, who: str, plain: str, *, held: bool) -> str:
-    """A held step's card title: what it does ("Email Dana Price"), with
-    who asked when it was a teammate's own ask. A reply to a contact's mail
-    is no ask of theirs, so it isn't put in their name; why it waited is on
-    the card's next line."""
-    if held and getattr(person, "is_principal", False):
-        return f"Waiting for your OK: {plain}"
-    if getattr(person, "id", None) is not None and getattr(person, "kind", "team") == "team" \
+def _headline(person: Any, who: str, plain: str, *, approver: int | None) -> str:
+    """A held step's card title: what it does ("Email Dana Price"), said
+    once (the card's chip already says it needs an OK), with who asked only
+    when the card is someone else's: a teammate's ask on an approver's list.
+    A reply to a contact's mail is no ask of theirs, so it isn't put in
+    their name; why it waited is on the card's next line."""
+    plain = plain[:1].upper() + plain[1:]
+    pid = getattr(person, "id", None)
+    if pid is not None and pid != approver and getattr(person, "kind", "team") == "team" \
             and not getattr(person, "is_principal", False):
         return f"{who} asked: {plain}"
-    return plain[:1].upper() + plain[1:]
+    return plain
+
 
 def hold(
     person: Person,
@@ -150,6 +152,7 @@ def hold(
     # The title says what it does in a few words ("Email Dana Price"); the
     # message itself shows in full under it.
     plain = take_the_lead.title(tool, tool_input, mcp=mcp, private=private)
+    plain = plain[:1].upper() + plain[1:]  # the title and the button say it alike
     listed = ""
     if more:
         summary = f"{each[0]} and {len(more)} more like it"
@@ -195,9 +198,12 @@ def hold(
                 source=DECISION_ALERT_SOURCE,
                 external_id=external_id,
                 severity=AlertSeverity.HIGH.value if escalated else AlertSeverity.MEDIUM.value,
-                headline=_headline(person, who, plain, held=held)[:160],
+                headline=_headline(person, who, plain, approver=verdict.approver_person_id)[:160],
                 body=f"{listed or shown}\n\nIt waited because {verdict.reason}.",
                 suggested_action=shown,
+                # The button names the step ("Email Dana Price"); a long
+                # one, or several, keeps Approve.
+                action_label="" if more else plain,
                 topic_tags=[
                     decision_instance_tag(decision_id),
                     f"decision_class:{DECISION_CLASS}",

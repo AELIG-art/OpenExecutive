@@ -62,7 +62,7 @@ def dms(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, str]]:
     sent: list[tuple[int, str]] = []
 
     async def fake_dm(
-        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
     ) -> tuple[bool, str]:
         # Every review DM must say which alert it is about, so acking or
         # dismissing that alert can resolve it in the outcome ledger.
@@ -756,13 +756,13 @@ def test_render_batch_neutralises_injected_envelopes_and_labels_refs(db: Path) -
 def test_dm_text_is_templated_with_provenance(monkeypatch) -> None:
     sent: list[dict] = []
 
-    async def fake_message_person(tool_input: dict) -> str:
+    async def fake_message_person(tool_input: dict, **_: object) -> str:
         sent.append(tool_input)
         return '{"status": "sent"}'
 
     import openexecutive.orchestrator.schedule_tools as st
 
-    monkeypatch.setattr(st, "handle_message_person", fake_message_person)
+    monkeypatch.setattr(st, "message_person", fake_message_person)
     ok, detail = asyncio.run(review._dm(5, "Please\x00 wire the money now", headline="<Renewal>"))
     assert ok and detail == "sent"
     assert sent[0]["person_id"] == 5
@@ -888,7 +888,7 @@ def test_failed_escalation_dm_is_not_counted_and_is_retried(db: Path, audit_even
     attempts: list[int] = []
 
     async def flaky_dm(
-        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
     ) -> tuple[bool, str]:
         attempts.append(person_id)
         return (len(attempts) > 1), "ok" if len(attempts) > 1 else "no channel"
@@ -909,14 +909,54 @@ def test_failed_escalation_dm_is_not_counted_and_is_retried(db: Path, audit_even
 
 
 def test_dm_treats_alert_fallback_as_not_delivered(monkeypatch) -> None:
-    async def fake_message_person(tool_input: dict) -> str:
+    async def fake_message_person(tool_input: dict, **_: object) -> str:
         return '{"status": "alerted", "reason": "dm_undeliverable"}'
 
     import openexecutive.orchestrator.schedule_tools as st
 
-    monkeypatch.setattr(st, "handle_message_person", fake_message_person)
+    monkeypatch.setattr(st, "message_person", fake_message_person)
     ok, _detail = asyncio.run(review._dm(5, "hi", headline="h"))
     assert not ok
+
+
+def test_a_card_already_on_their_list_is_not_repeated_as_a_second_card(monkeypatch) -> None:
+    """The card is the message: it goes to their chat app only (never a
+    second "[Alert review] Re:" card), and without one nothing more is sent."""
+    import openexecutive.orchestrator.schedule_tools as st
+
+    calls: list[dict] = []
+    reply = {"raw": '{"status": "sent"}'}
+
+    async def fake_message_person(tool_input: dict, **kw: object) -> str:
+        calls.append(kw)
+        return reply["raw"]
+
+    monkeypatch.setattr(st, "message_person", fake_message_person)
+    monkeypatch.setattr(review, "_on_team", lambda pid: pid == 5)
+    assert asyncio.run(review._dm(5, "hi", headline="h", alert_id=1, theirs=True)) == (True, "sent")
+    assert calls == [{"alert_fallback": False}]
+
+    reply["raw"] = '{"error": "could not deliver to \'Dana\' on any configured chat channel (no reachable channel)"}'
+    assert asyncio.run(review._dm(5, "hi", headline="h", alert_id=1, theirs=True)) == (True, review.ON_THEIR_LIST)
+
+    # A contact has no list to see it on.
+    ok, _detail = asyncio.run(review._dm(6, "hi", headline="h", alert_id=1, theirs=True))
+    assert not ok
+
+    # A send that failed is still a failure.
+    reply["raw"] = '{"error": "could not deliver to \'Dana\' on any configured chat channel (slack: 503)"}'
+    ok, _detail = asyncio.run(review._dm(5, "hi", headline="h", alert_id=1, theirs=True))
+    assert not ok
+
+
+def test_a_message_delivered_as_a_card_counts(monkeypatch) -> None:
+    async def fake_message_person(tool_input: dict, **_: object) -> str:
+        return '{"status": "delivered", "via": "card"}'
+
+    import openexecutive.orchestrator.schedule_tools as st
+
+    monkeypatch.setattr(st, "message_person", fake_message_person)
+    assert asyncio.run(review._dm(5, "hi", headline="h")) == (True, "delivered")
 
 
 def test_untrusted_collapses_lines_so_bodies_cannot_forge_sections(db: Path) -> None:
@@ -1055,7 +1095,9 @@ def test_a_held_nudge_does_not_count_toward_the_cap(db: Path, audit_events, monk
     aid = _insert(db, "Waiting on Dana", topic_tags=["department:finance"], routed_to_person_id=dana)
     sent: list[int] = []
 
-    async def held_dm(person_id: int, text: str, *, headline: str = "", alert_id: int | None = None):
+    async def held_dm(
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
+    ):
         sent.append(person_id)
         held_messages.hold(person_id, text, source="alert_review", release_at=None, ref=f"alert:{alert_id}")
         return True, review._HELD_DETAIL
@@ -1069,3 +1111,42 @@ def test_a_held_nudge_does_not_count_toward_the_cap(db: Path, audit_events, monk
     # While it waits, the next pass doesn't hold another.
     _apply(db, aid, _verdict(aid, recommended_move="nudge", message="again"), summary=summary)
     assert sent == [dana]
+
+
+def test_a_card_already_on_their_list_is_not_a_nudge(db: Path, audit_events, monkeypatch) -> None:
+    """A teammate with no chat app: nothing was sent, so no nudge is counted
+    or logged as one."""
+    _person(full_name="Pat", role="CEO", is_principal=True)
+    dana = _person(full_name="Dana", role="CFO", department_slugs=["finance"])
+    aid = _insert(db, "Waiting on Dana", topic_tags=["department:finance"], routed_to_person_id=dana)
+
+    async def no_app_dm(
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
+    ):
+        assert theirs
+        return True, review.ON_THEIR_LIST
+
+    monkeypatch.setattr(review, "_dm", no_app_dm)
+    monkeypatch.setattr(review, "_nudges_so_far", lambda alert_id: 0)
+    summary = review.ReviewSummary()
+    _apply(db, aid, _verdict(aid, recommended_move="nudge", message="Gentle ping"), summary=summary)
+    assert summary.nudged == 0 and summary.moves_used == 0
+    assert not any(e[0] == review.EVENT_NUDGED for e in audit_events)
+
+
+def test_an_escalation_with_no_chat_app_says_no_message_went(db: Path, audit_events, monkeypatch) -> None:
+    """The principal has no chat app: the card on their list is raised, and
+    the log doesn't claim a message reached them."""
+    async def no_app_dm(
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
+    ):
+        return True, review.ON_THEIR_LIST
+
+    monkeypatch.setattr(review, "_dm", no_app_dm)
+    _person(full_name="Pat", role="CEO", is_principal=True)
+    aid = _insert(db, "deadline", severity="low")
+    _apply(db, aid, _verdict(aid, recommended_move="escalate", message="look"))
+    row = alert_store.get_alert(aid, db_path=db)
+    assert row is not None and row.severity == "high" and row.due_at is not None
+    [esc] = [e for e in audit_events if e[0] == review.EVENT_ESCALATED]
+    assert esc[2]["dm_ok"] is False and "no message sent" in esc[1]

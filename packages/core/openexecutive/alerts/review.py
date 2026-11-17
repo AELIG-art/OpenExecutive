@@ -536,6 +536,9 @@ _DM_MAX_CHARS = 1200
 # `_dm`'s detail for a DM held by the recipient's notification settings
 # (people.held_messages): it goes later, so it is not yet a delivered nudge.
 _HELD_DETAIL = "held for their quiet hours or brief"
+# `_dm`'s detail when the card is already on their list and they have no
+# chat app: the card is the message.
+ON_THEIR_LIST = "on their list"
 
 
 def _dm_text(headline: str, text: str) -> str:
@@ -547,7 +550,7 @@ def _dm_text(headline: str, text: str) -> str:
 
 
 async def _dm(
-    person_id: int, text: str, *, headline: str = "", alert_id: int | None = None
+    person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
 ) -> tuple[bool, str]:
     """DM a rostered person through the real handler (server-side channel
     resolution + the outbound anti-spam guard). Returns (ok, detail).
@@ -555,30 +558,52 @@ async def _dm(
     Tagged as alert-review outreach about ``alert_id``, so acknowledging or
     dismissing that alert later resolves whether the DM landed. A caller
     about a critical alert wraps it in ``_urgent_if`` so it gets past the
-    person's quiet hours and digest (``people.notifications``)."""
+    person's quiet hours and digest (``people.notifications``).
+
+    ``theirs``: the card is already on their list (Home and the phone show
+    it), so the message only goes to their chat app. Without one there is
+    nothing to send: a second card saying "[Alert review] Re: <the card>"
+    only repeated it, once every pass."""
     import json
 
     from openexecutive.attunement.outcomes import SOURCE_ALERT_REVIEW, tag_proactive
-    from openexecutive.orchestrator.schedule_tools import handle_message_person
+    from openexecutive.orchestrator.schedule_tools import NO_REACHABLE_CHANNEL, message_person
 
     try:
         with tag_proactive(SOURCE_ALERT_REVIEW, f"alert:{alert_id}" if alert_id else ""):
-            raw = await handle_message_person({
-                "person_id": person_id, "text": _dm_text(headline, text),
-            })
+            raw = await message_person(
+                {"person_id": person_id, "text": _dm_text(headline, text)}, alert_fallback=not theirs,
+            )
         parsed = json.loads(raw)
     except Exception as exc:
         return False, f"dm failed: {exc}"
+    if theirs and isinstance(parsed, dict) and NO_REACHABLE_CHANNEL in str(parsed.get("error") or "") and _on_team(person_id):
+        # They have no chat app: the card on their list is the message. A
+        # send that failed stays a failure, and a contact, who never signs
+        # in, has no list.
+        return True, ON_THEIR_LIST
     # Only a real delivery counts. "alerted" means the handler fell back to
     # creating a NEW alert because the person has no channel — for the
     # review that would just mint another candidate to route next pass.
-    if isinstance(parsed, dict) and "error" not in parsed and parsed.get("status") == "sent":
-        return True, "sent"
+    if isinstance(parsed, dict) and "error" not in parsed and parsed.get("status") in ("sent", "delivered"):
+        return True, str(parsed.get("status"))
     # Held by the person's own notification settings: it is saved and goes
     # when they asked to hear, so the move happened.
     if isinstance(parsed, dict) and parsed.get("status") == "held":
         return True, _HELD_DETAIL
     return False, str(parsed.get("error") if isinstance(parsed, dict) else raw)[:200]
+
+
+def _on_team(person_id: int) -> bool:
+    """Whether ``person_id`` is someone on the team, who signs in and has
+    a list of cards. False on a read error."""
+    try:
+        from openexecutive.people.store import get_person
+
+        person = get_person(person_id)
+    except Exception:
+        return False
+    return person is not None and getattr(person, "kind", "team") == "team"
 
 
 def _urgent_if(urgent: bool) -> contextlib.AbstractContextManager[None]:
@@ -838,7 +863,7 @@ async def _apply_route(ctx: _MoveContext) -> None:
         with _urgent_if(alert.severity == "urgent"):
             ok, detail = await _dm(
                 target, v.message or f"Can you own this? {alert.headline}", headline=alert.headline,
-                alert_id=ctx.alert_id,
+                alert_id=ctx.alert_id, theirs=True,
             )
     ctx.summary.moves_used += 1
     if ok:
@@ -871,13 +896,20 @@ async def _apply_nudge(ctx: _MoveContext) -> None:
     with _urgent_if(alert.severity == "urgent"):
         ok, detail = await _dm(
             target, v.message or f"Checking in on: {alert.headline}", headline=alert.headline,
-            alert_id=ctx.alert_id,
+            alert_id=ctx.alert_id, theirs=alert.routed_to_person_id == target,
         )
-    ctx.summary.moves_used += 1
+    if detail != ON_THEIR_LIST:  # nothing went, so no move was spent
+        ctx.summary.moves_used += 1
     if ok and detail == _HELD_DETAIL:
         # Not delivered yet: no nudge counted toward the cap.
         _audit(EVENT_REVIEWED, f"Nudge about '{alert.headline[:80]}' held for the recipient",
                {**ctx.base_details, "target_person_id": target, "held": True})
+        return
+    if ok and detail == ON_THEIR_LIST:
+        # Nothing was sent: the card on their list is all they have. Not a
+        # nudge, so it never counts as one.
+        _audit(EVENT_REVIEWED, f"'{alert.headline[:80]}' is already on their list",
+               {**ctx.base_details, "target_person_id": target, "on_their_list": True})
         return
     if ok:
         ctx.summary.nudged += 1
@@ -906,6 +938,7 @@ async def _apply_escalate(ctx: _MoveContext) -> None:
             v.message or f"Needs you today: {alert.headline}\n{v.why_now or ''}".strip(),
             headline=alert.headline,
             alert_id=ctx.alert_id,
+            theirs=alert.routed_to_person_id in (None, ctx.principal_id),
         )
     ctx.summary.moves_used += 1
     if not ok:
@@ -920,8 +953,11 @@ async def _apply_escalate(ctx: _MoveContext) -> None:
     ctx.due_at = ctx.due_at or (ctx.now + timedelta(hours=_DEFAULT_ESCALATION_HOURS)).isoformat()
     ctx.summary.escalated += 1
     ctx.move_taken = "escalate"
-    _audit(EVENT_ESCALATED, f"Escalated '{alert.headline[:80]}' to {new_sev} ({detail})",
-           {**ctx.base_details, "new_severity": new_sev, "due_at": ctx.due_at, "dm_ok": ok})
+    # With no chat app the card on their list is raised; no message went.
+    sent = detail != ON_THEIR_LIST
+    _audit(EVENT_ESCALATED,
+           f"Escalated '{alert.headline[:80]}' to {new_sev} ({detail if sent else 'raised on their list, no message sent'})",
+           {**ctx.base_details, "new_severity": new_sev, "due_at": ctx.due_at, "dm_ok": sent})
 
 
 async def _apply_draft(ctx: _MoveContext) -> None:
