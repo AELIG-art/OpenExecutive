@@ -58,6 +58,8 @@ import NextTimeTick from "@/components/NextTimeTick";
 // While a send Gmail hasn't confirmed is being settled (the card is
 // "executing"), how often the cards are read again.
 const SETTLE_POLL_MS = 20_000;
+// What shows while "Reply to" is being changed.
+const RECIPIENTS_RUNNING = "Changing who it goes to…";
 
 // The cards and their refresh, for the Home "Needs you" list, which shows
 // each one as a card among the proposals. `cards` stays null for anyone but
@@ -210,7 +212,7 @@ export function ReplyCardItem({
 
   const pickRecipients = async (everyone: boolean) => {
     if (!choice || everyone === choice.toEveryone) return;
-    setStep({ kind: "busy", label: "Saving…" });
+    setStep({ kind: "busy", label: RECIPIENTS_RUNNING });
     setError(null);
     try {
       onChanged?.(await setReplyRecipients(card.decision_id, everyone));
@@ -305,6 +307,9 @@ export function ReplyCardItem({
   };
 
   const busy = step.kind === "busy";
+  // Each button shows only its own running words, so Don't send or Save never
+  // reads as "Sending…" on the Send button.
+  const running = (label: string) => step.kind === "busy" && step.label === label;
   const confirming = step.kind === "ask" || step.kind === "confirm";
   const label = "text-xs font-semibold uppercase tracking-wide text-fg-muted";
   // Closed, the card is its summary, what's left to decide and one main
@@ -349,7 +354,7 @@ export function ReplyCardItem({
     // Don't send is its own button, set apart on the right, so it's never
     // hunted for in a menu next to Send.
     <Button variant="ghost" className="ml-auto" onClick={() => void dismiss()} disabled={busy}>
-      Don&apos;t send
+      {running("Removing…") ? "Removing…" : "Don't send"}
     </Button>
   );
 
@@ -622,6 +627,9 @@ export function ReplyCardItem({
           )}
         </div>
         <div className="mt-1 text-xs text-fg-subtle break-words" title={card.draft_to.join(", ")}>To {recipientNames(card.draft_to)}</div>
+        {running(RECIPIENTS_RUNNING) && (
+          <p className="mt-1 text-xs text-fg-subtle" aria-live="polite">{RECIPIENTS_RUNNING}</p>
+        )}
         {editing !== null ? (
           <div className="mt-1.5">
             <textarea
@@ -640,7 +648,7 @@ export function ReplyCardItem({
             </p>
             <div className="mt-2 flex flex-wrap items-center gap-2">
               <Button variant="primary" onClick={() => void saveEdit()} disabled={busy || !editing.trim()}>
-                {busy ? step.label : "Save"}
+                {running("Saving…") ? "Saving…" : "Save"}
               </Button>
               <Button variant="ghost" onClick={() => setEditing(null)} disabled={busy}>
                 Cancel
@@ -787,7 +795,7 @@ export function ReplyCardItem({
             onClick={askToSend}
             disabled={busy || left > 0}
           >
-            {busy ? step.label : "Send"}
+            {running("Sending…") ? "Sending…" : "Send"}
           </Button>
           {gmailLink && (
             <a
