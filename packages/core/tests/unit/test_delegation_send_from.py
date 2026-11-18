@@ -155,7 +155,7 @@ def test_saying_it_on_the_card_switches_the_same_card(
 
     monkeypatch.setattr(answers, "_call_model", fake)
     mailbox, card = _card(owner)
-    saved, changed = asyncio.run(answers.change(
+    saved, changed, _ = asyncio.run(answers.change(
         _fresh(card), caller=LOCAL, resolver=owner.id, text="send it from you and cc me", gmail=mailbox,
     ))
     assert changed == []
@@ -166,6 +166,36 @@ def test_saying_it_on_the_card_switches_the_same_card(
     assert turns[-1]["text"] == send_from.NOTE_TO_EXECUTIVE
     # Still one card.
     assert len(inbox.open_cards(owner.id)) == 1
+
+
+@pytest.mark.parametrize("go", [True, False])
+def test_send_it_from_you_switches_the_sender_and_waits(
+    db: Path, owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch, go: bool,
+) -> None:
+    from openexecutive.alerts import replan
+
+    async def fake(model: str, system: str, turn: str) -> dict[str, Any]:
+        if system == send_from.AS_EXECUTIVE_PROMPT:
+            return {"body": "Hi Dana,\n\nOlivia asked me to reply."}
+        main = turn.split("<draft>\n", 1)[1].split("\n</draft>", 1)[0]
+        return {"body": main, "send_now": True, "send_from": "executive"}
+
+    async def judged(system: str, tool: dict[str, Any], turn: str, **kw: Any) -> dict[str, Any]:
+        return {"go": go}
+
+    monkeypatch.setattr(answers, "_call_model", fake)
+    monkeypatch.setattr(replan, "_call_tool", judged)
+    replan._CALLS.clear()
+    replan._CALLER_CALLS.clear()
+    mailbox, card = _card(owner)
+    saved, changed, send_now = asyncio.run(answers.change(
+        _fresh(card), caller=LOCAL, resolver=owner.id, text="send it from you", gmail=mailbox,
+    ))
+    # Who it goes from switches either way; the send waits, since the new
+    # wording is theirs to read first.
+    assert changed == [] and send_now is False
+    assert saved[send_from.FROM_EXECUTIVE] is True
+    assert saved["conversation"][-1]["text"] == send_from.NOTE_TO_EXECUTIVE
 
 
 def test_a_rewrite_on_a_switched_card_keeps_it_from_the_executive(
@@ -389,7 +419,7 @@ def test_new_words_stay_when_the_switch_asked_with_them_fails(
 
     monkeypatch.setattr(answers, "_call_model", fake)
     mailbox, card = _card(owner)
-    saved, _ = asyncio.run(answers.change(
+    saved, _, _ = asyncio.run(answers.change(
         _fresh(card), caller=LOCAL, resolver=owner.id, text="shorten it and send it from you", gmail=mailbox,
     ))
     assert "Shorter." in saved["draft_body"] and saved.get(send_from.FROM_EXECUTIVE) is not True

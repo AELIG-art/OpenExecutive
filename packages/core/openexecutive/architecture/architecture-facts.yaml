@@ -4164,6 +4164,25 @@ departments:
     person's words, never the card, and approves at once through the same
     Approve as a tap (Approvals still decide) only when both say go;
     otherwise the reply is "Here's the plan now. Pick it to go ahead."
+    A held step's card (take_the_lead_action, department_action) has the
+    same Or tell me at POST /decisions/{id}/say: replan.rewrite_fields
+    (tool rewrite_fields, actor card_fields, constant FIELDS_SYSTEM, the
+    same hourly budget) returns only the step's editable fields that
+    changed, kept as said_input on the decision's payload
+    (update_open_payload, compare-and-set) once the step's own rules for a
+    change (take_the_lead.apply_edits) take it; words they turn down change
+    nothing. The card that shows it puts it in and sends it as edits.input;
+    an Approve without edits (another page, a chat app's tap, which show
+    the step as filed) sends the step as filed, so nothing goes out with
+    wording said after it was shown. A go approves with the edits it judged. A field longer than EDIT_MAX is
+    not rewritten (422: changed by hand), never cut. A go is judged by
+    replan.said_go against the fields the card showed, whole
+    (STEP_TEXT_MAX, not a plan's 600), and approves through the class's
+    own approve, as a tap; when it isn't sure, the reply says to tap Do it.
+    Only someone who may change the step with Approve's own edits says it
+    (decisions._may_change: a Take the lead card's principal, a held
+    step's principal or approver; anyone else gets 409), and the carried
+    out payload drops said_input, so the final record shows what was sent.
     Both what the person said and the reply are kept as the card's
     conversation (alert_card_turns), each line with the person it is
     between (person_id); /today and the say response show a reader only
@@ -12329,7 +12348,11 @@ delegation:
     /delegation/replies/{id}/change {text} (answers.change) rewrites it the
     way the person said, through the same rewrite as <change>, and adds
     their words and the Executive's note to the card's conversation (shown
-    by ReplyCardOut.conversation). POST
+    by ReplyCardOut.conversation). When the words only say to send it
+    (the rewrite's send_now, then replan.said_go on the draft and their
+    words, the same go check as every card), nothing is rewritten: it
+    answers send_now true and the card brings up the send's confirm, as a
+    tap on Send does; unsure, the card says to tap Send. POST
     /delegation/replies/{id}/answer {answers: [{question_index,
     answer_text}]} (delegation.answers) answers what the reply left open:
     one composer-model call (REWRITE_PROMPT + the person's voice block, no
