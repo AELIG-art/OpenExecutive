@@ -215,6 +215,15 @@ _ATTRIBUTION_MAX_LINES = 4
 # Where everything below is an older message rather than the sender's text.
 _ORIGINAL_MESSAGE_RE = re.compile(r"^-{2,}\s*Original Message\s*-{2,}", re.IGNORECASE)
 _FORWARDED_RE = re.compile(r"^-{2,}\s*Forwarded message\s*-{2,}", re.IGNORECASE)
+# Apple Mail and iPhone forward with this line, the forwarded message quoted
+# with ">" below it ("> Begin forwarded message:"), or unquoted.
+_BEGIN_FORWARDED_RE = re.compile(r"^(>\s?)?Begin forwarded message:\s*$", re.IGNORECASE)
+_FORWARD_SUBJECT_RE = re.compile(r"^\s*(\[[^\]]{0,40}\]\s*)*(fwd?|fw|wg|tr|rv)(\[\d{1,3}\])?\s*:", re.IGNORECASE)
+# A reply's subject prefix (not a forward's), in the common mail languages.
+_REPLY_ONLY_SUBJECT_RE = re.compile(
+    r"^\s*(\[[^\]]{0,40}\]\s*)*(re|aw|sv|vs|antw|antwort|rif|res|odp|ynt|vá|отв|回复|答复)(\[\d{1,3}\])?\s*[:：]",
+    re.IGNORECASE,
+)
 _OUTLOOK_RULE_RE = re.compile(r"^_{10,}\s*$")
 _OUTLOOK_HEADER_RE = re.compile(r"^From:\s")
 _OUTLOOK_SENT_RE = re.compile(r"^(Sent|Date):\s")
@@ -390,47 +399,190 @@ def _retrieval_query(raw_email: str) -> str:
     return (words or topic or raw_email)[:500]
 
 
-def _new_text_lines(body: list[str]) -> tuple[list[str], bool]:
+def _new_text_lines(body: list[str], subject: str = "") -> tuple[list[str], bool]:
     """The sender's own lines, without quoted replies, stopping where an
     older message is appended below. Returns (lines, whether a forwarded
-    message was cut off).
+    message was cut off). A ">"-quoted forward does not count under a
+    reply ``subject``."""
+    kept, cut_at, forwarded = _scan_new_text(body, subject)
+    return kept, forwarded and cut_at is not None
+
+
+def _scan_new_text(body: list[str], subject: str = "") -> tuple[list[str], int | None, bool]:
+    """The sender's own lines, the index where an older message appended
+    below them starts (None when none is), and whether that line opened a
+    forwarded message rather than reply history.
 
     A reply attribution followed by ">" lines is skipped rather than ending
     the scan, so text the sender wrote below a quote (bottom-posting or an
-    interleaved reply) is kept.
+    interleaved reply) is kept. A forward marker counts only before any
+    reply attribution: one inside quoted history is that history's. A
+    ">"-quoted forward (Apple Mail) is skipped like any quote, its start
+    noted, so a note written below it is kept; an unquoted one ends the scan.
     """
     kept: list[str] = []
     i = 0
+    # A ">"-quoted forward marker in a reply (Re:, AW:, SV: ...) is quoted
+    # history, whatever language the reply's attribution line is in.
+    quoted_forwards = _REPLY_ONLY_SUBJECT_RE.match(subject or "") is None
+    replied = False
+    quoted_forward: int | None = None
+
+    def stop(at: int, forwarded: bool) -> tuple[list[str], int | None, bool]:
+        if quoted_forward is not None:
+            return kept, quoted_forward, True
+        return kept, at, forwarded
+
     while i < len(body):
         text = body[i].strip()
-        if _FORWARDED_RE.match(text):
-            return kept, True
+        if _FORWARDED_RE.match(text) or (
+            not replied and quoted_forward is None and _BEGIN_FORWARDED_RE.match(text)
+            and not (text.startswith(">") and (not quoted_forwards or _inside_quote(body, i)))
+        ):
+            if text.startswith(">"):
+                quoted_forward = i
+            elif quoted_forward is None and next(
+                (b.strip() for b in body[i + 1:] if b.strip()), ""
+            ).startswith(">"):
+                # An iPhone marker over a ">"-quoted forward: skip the quote
+                # like any other, so a note written below it is kept.
+                quoted_forward = i
+                i += 1
+                continue
+            else:
+                return stop(i, True)
         if _ORIGINAL_MESSAGE_RE.match(text) or _OUTLOOK_RULE_RE.match(text):
-            break
+            return stop(i, False)
         if _OUTLOOK_HEADER_RE.match(text) and any(
             _OUTLOOK_SENT_RE.match(b.strip())
             for b in body[i + 1:i + 1 + _OUTLOOK_HEADER_SPAN]
         ):
-            break
+            return stop(i, False)
         attribution = _attribution_end(body, i)
         if attribution is not None:
             end, quoted = attribution
             if not quoted:
-                break
+                return stop(i, False)
+            replied = True
             i = end + 1
             continue
         if not text.startswith(">") and text != _NO_BODY_PLACEHOLDER:
             kept.append(body[i].rstrip())
         i += 1
-    return kept, False
+    return stop(i, False) if quoted_forward is not None else (kept, None, False)
 
 
 def sender_new_text(body: str) -> str:
     """A message body without the quoted replies or forwarded message below
     it — just what its sender wrote. Act as me's voice learner reads the
-    principal's own sent mail through this (``delegation.voice``)."""
+    principal's own sent mail through this (``delegation.voice``). To read
+    an email for what it says, use ``readable_text``: a forward's content
+    is not anywhere else in the thread."""
     lines, _forwarded = _new_text_lines(body.splitlines())
     return "\n".join(lines).strip()
+
+
+FORWARDED_HEADING = "Forwarded message:"
+
+
+def readable_text(
+    body: str, subject: str = "", *, max_chars: int | None = None, forwarded_chars: int | None = None,
+) -> str:
+    """What an email says, to read it: its sender's own words
+    (``sender_new_text``), then any message they forwarded, under
+    ``FORWARDED_HEADING`` with the forward's own ">" quoting taken off
+    (``split_forward``). With ``forwarded_chars``, ``max_chars`` caps the
+    sender's words and ``forwarded_chars`` the forwarded message; without
+    it, ``max_chars`` caps the whole text."""
+    own, inner = split_forward(body, subject, max_chars=max_chars, forwarded_chars=forwarded_chars)
+    text = f"{own}\n\n{FORWARDED_HEADING}\n{inner}".strip() if inner else own
+    # Without forwarded_chars, max_chars is the cap on the whole text.
+    return text[:max_chars] if max_chars is not None and forwarded_chars is None else text
+
+
+def _forward_quote(lines: list[str]) -> int | None:
+    """Where the forwarded email starts in a forward whose marker isn't
+    recognised: the last ">" run that stands as its own block (after a blank
+    line or at the top), so a line the sender quotes inline above it isn't
+    taken for it; else the last ">" run. None when there is none or a reply
+    attribution opens first."""
+    block = run = None
+    for i, line in enumerate(lines):
+        if _attribution_end(lines, i) is not None:
+            break
+        prev = lines[i - 1].strip() if i else ""
+        if line.lstrip().startswith(">") and not prev.startswith(">"):
+            run = i
+            if not prev:
+                block = i
+    return block if block is not None else run
+
+
+def _inside_quote(lines: list[str], i: int) -> bool:
+    """Whether the ">" line at ``i`` is inside a quote rather than opening
+    one. Apple Mail opens a forward's quote with its marker; a marker further
+    down a quote belongs to the quoted history, whatever its language."""
+    for j in range(i - 1, -1, -1):
+        prev = lines[j].strip()
+        if prev and prev != ">":
+            return prev.startswith(">")
+    return False
+
+
+def split_forward(
+    body: str, subject: str = "", *, max_chars: int | None = None, forwarded_chars: int | None = None,
+) -> tuple[str, str]:
+    """An email's sender's own words and the message they forwarded in it
+    ("" when none), apart, so a reader can keep someone else's forwarded
+    words out of what it marks as the sender's. Reply history quoted below
+    is left out (each earlier message is its own message in the thread),
+    except in a forward (``subject`` Fwd:/Fw:), where an Outlook-style header
+    block is the forwarded message."""
+    lines = body.splitlines()
+    kept, cut_at, forwarded = _scan_new_text(lines, subject)
+    is_forward = _FORWARD_SUBJECT_RE.match(subject or "") is not None
+    if cut_at is None and is_forward:
+        # A forward whose marker is in another language ("Anfang der
+        # weitergeleiteten Nachricht:"): its last ">" block, when no reply
+        # attribution comes before it, is the forwarded email.
+        # The scan skipped it like any quote, so their words above and below
+        # it are already kept.
+        cut_at = _forward_quote(lines)
+    # A skipped quote leaves the blank lines around it: one is enough.
+    own = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    if max_chars is not None:
+        own = own[:max_chars]
+    if cut_at is None or not (forwarded or is_forward):
+        return own, ""
+    rest = lines[cut_at:]
+    if rest and not rest[0].lstrip().startswith(">") and (
+        _BEGIN_FORWARDED_RE.match(rest[0].strip())
+        or _FORWARDED_RE.match(rest[0].strip())
+        or _OUTLOOK_RULE_RE.match(rest[0].strip())
+    ):
+        rest = rest[1:]  # the reader's own heading says it
+    first = next((k for k, ln in enumerate(rest) if ln.strip()), None)
+    if first is not None and rest[first].lstrip().startswith(">"):
+        # Quoted (Apple Mail, or an iPhone marker with its forward quoted
+        # below): the forward is the run of ">" lines, one level of ">" off
+        # each. What the sender wrote below it is in ``kept``.
+        end = len(rest)
+        for k in range(first, len(rest)):
+            if rest[k].strip() and not rest[k].lstrip().startswith(">"):
+                end = k
+                break
+        after = rest[end:]
+        rest = [re.sub(r"^(\s*)>\s?", r"\1", ln) for ln in rest[first:end]]
+        if rest and _BEGIN_FORWARDED_RE.match(rest[0].strip()):
+            rest = rest[1:]
+        # A second forward below it (where the scan stopped) is forwarded too.
+        later = next((k for k, ln in enumerate(after) if _FORWARDED_RE.match(ln.strip())
+                      or _BEGIN_FORWARDED_RE.match(ln.strip())), None)
+        if later is not None:
+            rest += ["", *after[later:]]
+    inner = "\n".join(ln.rstrip() for ln in rest).strip()
+    cap = forwarded_chars if forwarded_chars is not None else max_chars
+    return own, inner[:cap] if cap is not None else inner
 
 
 def _email_memory_text(raw: str) -> str:
@@ -451,7 +603,7 @@ def _email_memory_text(raw: str) -> str:
         (ln.split(":", 1)[1].strip() for ln in header if ln.lower().startswith("subject:")),
         "",
     )
-    new_lines, forwarded = _new_text_lines(body)
+    new_lines, forwarded = _new_text_lines(body, subject)
     new_text = "\n".join(new_lines).strip()
     names = [name for name in map(_attachment_name, attachments) if name]
 
@@ -1257,7 +1409,7 @@ def _unproven_notice(from_addr: str, person: Any, principal_name: str) -> str:
 def _forwarded(raw_email: str) -> bool:
     """Whether the message carries a forwarded one below the sender's text."""
     _header, body, _attachments = _split_gmail_content(raw_email)
-    return _new_text_lines(body)[1]
+    return _new_text_lines(body, _header_subject(raw_email))[1]
 
 
 def _private_to_principal_mail(from_addr: str, raw_email: str) -> bool:

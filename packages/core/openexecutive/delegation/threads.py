@@ -25,6 +25,9 @@ from typing import Any
 MAX_RECIPIENTS = 10
 THREAD_MESSAGES = 6
 THREAD_MESSAGE_CHARS = 1500
+# Messages forwarded inside the thread's (``email_poller.readable_text``),
+# all together, the newest first.
+THREAD_FORWARDED_CHARS = 6000
 
 _HEADER_LINE_RE = re.compile(r"^(\s*)(\[\s*\d+\s*\]\s*From\s*:)", re.IGNORECASE | re.MULTILINE)
 
@@ -49,20 +52,29 @@ def mine(message: Any, own: str) -> bool:
 
 
 def thread_text(thread: Any, own: str) -> str:
-    """The last few messages of the thread, each only its sender's own words,
-    all labelled alike: nothing here says which are the writer's
-    (``writer_said`` does)."""
+    """The last few messages of the thread, each its sender's own words and
+    any email they forwarded (one shared budget, the newest first), all
+    labelled alike: nothing here says which are the writer's (``writer_said``
+    does)."""
     from openexecutive.delegation.ghostwriter import one_line
-    from openexecutive.integrations.email_poller import sender_new_text
+    from openexecutive.integrations.email_poller import FORWARDED_HEADING, split_forward
     from openexecutive.utils.prompt_blocks import plain
 
+    shown = _shown_messages(thread)
     parts = []
-    for i, m in enumerate(_shown_messages(thread), 1):
+    budget = THREAD_FORWARDED_CHARS
+    for i in range(len(shown), 0, -1):
+        m = shown[i - 1]
         who = one_line(m.from_name or m.from_addr, 120)
+        own_words, forwarded = split_forward(
+            m.text or "", m.subject, max_chars=THREAD_MESSAGE_CHARS, forwarded_chars=budget,
+        )
+        budget -= len(forwarded)
+        said = f"{own_words}\n\n{FORWARDED_HEADING}\n{forwarded}".strip() if forwarded else own_words
         # Plain first, so no hidden or look-alike character dodges the quoting.
-        text = _quote_headers(plain(sender_new_text(m.text or "")[:THREAD_MESSAGE_CHARS]))
+        text = _quote_headers(plain(said))
         parts.append(f"[{i}] From: {who} — {one_line(m.date, 60)}\n{text}")
-    return "\n\n".join(parts)
+    return "\n\n".join(reversed(parts))
 
 
 def writer_said(thread: Any, own: str) -> str:
