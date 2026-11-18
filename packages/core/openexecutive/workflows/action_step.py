@@ -55,6 +55,9 @@ from typing import Any
 from openexecutive.agents.workflow_actor import WORKFLOW_ACTOR_AGENT_ID, WorkflowActorAgent
 from openexecutive.config import get_settings
 from openexecutive.orchestrator import turn_live
+from openexecutive.orchestrator.reading import TurnReadingBudget, with_turn_limits
+from openexecutive.providers.feature_gate import ReadingLimits
+from openexecutive.providers.registry import reading_limits_for
 from openexecutive.providers.translator import reasoning_replay_block
 from openexecutive.workflows import step_script, tool_catalog
 from openexecutive.workflows.approved_targets import approved_values, normalize_value
@@ -590,6 +593,8 @@ class _StepCalls:
         self._policy = policy
         self._actions = actions
         self._holds = _Holds()
+        # The step's reading limits, for a tool that sizes its own parts.
+        self.limits: ReadingLimits | None = None
         self._events: list[StepYield] = []
         # A tool stopped the step (``extensions.workflow_hold`` / ``_wait``).
         self.stopped = False
@@ -683,7 +688,10 @@ class _StepCalls:
 
                 try:
                     with extensions.collect_workflow_signals() as signals:
-                        content, is_error = await _call_tool(name, arguments, info, self._workflow_name)
+                        call = _call_tool(name, arguments, info, self._workflow_name)
+                        content, is_error = await (
+                            with_turn_limits(self.limits, call) if self.limits is not None else call
+                        )
                 except asyncio.CancelledError:
                     # Stopped mid-call (a script's clock, or the run): it may
                     # have taken effect, so it still gets its audit row.
@@ -869,6 +877,10 @@ async def run_action_step(
         actions=actions,
     )
 
+    # How much the step's reads may hold, from its model; a long result
+    # comes back in parts (orchestrator.reading).
+    reading = TurnReadingBudget(reading_limits_for(resolved_model))
+    calls.limits = reading.limits
     max_turns = step.max_tool_calls + _EXTRA_TURNS
     fanout_hinted = False
     turn = 0
@@ -920,10 +932,23 @@ async def run_action_step(
 
         _append_assistant(messages, blocks)
         results: list[dict[str, Any]] = []
+        # A repeat of a call whose result came in parts gets the next part;
+        # a call that may change something drops the parts held from before.
+        replays = {str(u["id"]): r for u in tool_uses if (r := reading.replay(u)) is not None}
+        if len(replays) == len(tool_uses):
+            # Only next parts of what the step already read: nothing ran, so
+            # the round leaves the step's turns for the work it reads for.
+            turn -= 1
+        reading.ran(tool_uses)
         for use in tool_uses:
             name = str(use["name"])
             arguments = use["input"] if isinstance(use["input"], dict) else {}
-            if scripts and name == step_script.RUN_SCRIPT_TOOL:
+            replayed = replays.get(str(use["id"]))
+            if replayed is not None:
+                # The next part of a long result the step already has: the
+                # tool does not run again.
+                content, is_error = replayed, False
+            elif scripts and name == step_script.RUN_SCRIPT_TOOL:
                 yield ("progress", "Running a script…")
                 content, is_error = json.dumps({"error": "the script did not finish"}), True
                 stats: dict[str, Any] = {}
@@ -957,7 +982,7 @@ async def run_action_step(
                 {
                     "type": "tool_result",
                     "tool_use_id": use["id"],
-                    "content": _truncate(str(content), settings.tool_result_max_chars),
+                    "content": reading.cap(name, use["input"], str(content), str(use["id"])),
                     "is_error": is_error,
                 }
             )

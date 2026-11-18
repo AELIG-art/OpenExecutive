@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import itertools
 import json
 import logging
 import re
 import time
 import uuid
+import zlib
 from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -163,6 +165,7 @@ from openexecutive.orchestrator.people_tools import (
     is_principal_on_verified_surface,
     turn_is_private_to_principal,
 )
+from openexecutive.orchestrator.reading import TurnReadingBudget, with_turn_limits
 from openexecutive.orchestrator.research_tools import (
     RESEARCH_TOOL_HANDLERS,
     RESEARCH_TOOLS,
@@ -217,7 +220,8 @@ from openexecutive.orchestrator.workflow_run_tools import (
 )
 from openexecutive.prompts.cache_manager import build_system_blocks
 from openexecutive.providers import get_provider
-from openexecutive.providers.registry import sees_images
+from openexecutive.providers.feature_gate import MAX_OUTPUT_TOKENS
+from openexecutive.providers.registry import reading_limits_for, sees_images
 from openexecutive.providers.translator import reasoning_replay_block
 from openexecutive.workflows import python_job, step_script, turn_files
 from openexecutive.workflows.action_step import looks_like_error
@@ -352,215 +356,6 @@ def _trunc(value: Any, limit: int = 200) -> str:
     if len(s) <= limit:
         return s
     return f"{s[:limit]}…[truncated {len(s) - limit} chars]"
-
-
-# Smallest cap for which the never-exceeds-limit guarantee holds; mirrored
-# by the ge= bound on TOOL_RESULT_MAX_CHARS in config.py.
-_MIN_USEFUL_CAP = 1_000
-
-# Longest tool name echoed into a truncation marker. Real names are well
-# under this (the longest in the MCP surface is ~40 chars); the bound exists
-# so a model-supplied name cannot inflate the marker past its own budget.
-_TOOL_NAME_MARKER_MAX = 80
-# Once a turn's reading budget (TOOL_RESULTS_TURN_MAX_CHARS) is used up, a
-# further tool result still shows this much, so the model sees what it got.
-_TURN_BUDGET_FLOOR = 3_000
-
-# Results the turn's reading budget counts but never cuts (see
-# _turn_result_limit).
-_NEVER_CUT_BY_TURN_BUDGET = frozenset(
-    {step_script.RUN_SCRIPT_TOOL, tool_groups.OPEN_TOOLS, "search_tools"}
-)
-
-
-def _cap_tool_result(
-    text: Any, *, tool_name: str, limit: int, budget_spent: bool = False, full_reread_left: bool = False
-) -> Any:
-    """Bound one tool result before it enters the prompt.
-
-    A circuit breaker, not a routine clipper: the default budget is set so
-    it never fires on ordinary tool output. It exists because a single
-    unbounded result (a large document fetch) otherwise lands in the
-    context and is then re-sent on every remaining iteration of the tool
-    loop, which is the dominant token cost of a long turn.
-
-    The marker is load-bearing. Truncating silently is worse than not
-    truncating: the model reads the cut text as the whole answer and
-    confabulates the rest. Naming the tool and steering toward a
-    *narrower* re-request (rather than a retry, which would re-trigger
-    the cut and burn another iteration) is what makes the cut recoverable.
-
-    Non-``str`` results pass through untouched — every producer returns a
-    string today, and guessing at the size of some other type is not this
-    function's job.
-
-    ``limit`` is passed in rather than read here: ``get_settings()`` builds
-    a fresh ``Settings`` on every call, and this runs once per tool result.
-
-    Precondition: ``limit`` must be at least ``_MIN_USEFUL_CAP``. The
-    "never exceeds ``limit``" guarantee holds by reserving the marker
-    inside the budget, and the marker itself is ~280-850 chars — below
-    that floor there is no room for it and the guarantee breaks. The
-    config field enforces this with ``ge=1_000``.
-
-    ``budget_spent`` says the turn's reading budget, not this result's own
-    size, set ``limit``: the marker then says to answer from what the turn
-    has rather than read more, and never to edit from the cut text. With
-    ``full_reread_left`` it also offers the turn's one full re-read
-    (``_TurnReadingBudget``), so an edit the question asked for can still
-    be done from the whole document.
-    """
-    if not isinstance(text, str):
-        return text
-    if len(text) <= limit:
-        return text
-
-    # ``tool_name`` comes from the model's tool_use block, so it is
-    # attacker-influenceable via prompt injection. Two consequences:
-    #   * it is never passed through ``str.format`` — a name containing
-    #     braces would otherwise be interpreted as a field reference,
-    #     substituting our locals or raising and killing the turn;
-    #   * it is length-bounded, so the marker cannot outgrow the budget
-    #     it is supposed to fit inside.
-    safe_name = tool_name[:_TOOL_NAME_MARKER_MAX] if isinstance(tool_name, str) else "?"
-
-    def marker(shown: int, pct: int) -> str:
-        return (
-            f"\n\n[TRUNCATED by Open Executive: showed the first {shown:,} of "
-            f"{len(text):,} characters from `{safe_name}` ({pct}% omitted). "
-            "This is NOT the full result."
-            + (
-                # A narrower re-read would be cut the same way, so the
-                # budget note replaces the "ask again" advice.
-                " This question has already read as much as it can. Never "
-                "edit, rewrite or replace anything from this cut result."
-                + (
-                    " If you need this whole result to edit or rewrite it, "
-                    "call the tool again with exactly the same input: that "
-                    "repeat does not run the tool again, it brings back this "
-                    "same result in full (once per question)."
-                    if full_reread_left
-                    else " If you needed it to edit or rewrite something, say "
-                    "it was too long to work on here and offer to do it as "
-                    "its own request."
-                )
-                + " Otherwise answer from what you have, and say what you "
-                "could not read."
-                if budget_spent
-                else " To see more, call the tool again with a narrower "
-                "request — a page range, a section name, a query or filter — "
-                "rather than re-requesting the whole document."
-            )
-            + "]"
-        )
-
-    # Reserve the marker inside the budget so the capped result never
-    # exceeds ``limit``. Reserve against the widest form: ``shown`` can
-    # never exceed ``limit``, and ``pct`` can round up to 100 (three
-    # digits), so no real marker is longer than this one. With safe_name
-    # bounded, the reserve stays well under the config's 1_000 minimum.
-    shown = max(0, limit - len(marker(limit, 100)))
-    pct = round((len(text) - shown) * 100 / len(text))
-    logger.warning(
-        "tool_result truncated tool=%s original_chars=%d shown_chars=%d limit=%d",
-        safe_name, len(text), shown, limit,
-    )
-    return text[:shown] + marker(shown, pct)
-
-
-def _turn_result_limit(name: str, *, per_result: int, turn_budget: int, used: int) -> tuple[int, bool]:
-    """The cap for one tool result, given what the turn has already read.
-
-    Every tool result stays in the prompt for each later call of the turn,
-    so a turn that reads several long documents re-sends all of them on
-    every call. ``turn_budget`` (TOOL_RESULTS_TURN_MAX_CHARS; 0 = off)
-    bounds what a turn's results add together: once ``used`` reaches it, a
-    further result is cut to ``_TURN_BUDGET_FLOOR``. Returns (limit, whether
-    the budget rather than ``per_result`` set it). A specialist's analysis
-    is the answer itself, not a read, so it neither counts nor is cut by the
-    budget. A built tool's result counts but is never cut below
-    ``per_result``: it is already bounded (step_script), and it lists the
-    writes that already ran, which a short cut would hide and the model would
-    then repeat. Tool discovery (``open_tools``, ``search_tools``) is treated
-    the same way: its result is the schema for the next call, and a cut one
-    would leave the model unable to make it.
-    """
-    if turn_budget <= 0 or name == "consult_specialist":
-        return per_result, False
-    if name in _NEVER_CUT_BY_TURN_BUDGET:
-        return per_result, False
-    remaining = turn_budget - used
-    if remaining >= per_result:
-        return per_result, False
-    return min(per_result, max(_TURN_BUDGET_FLOOR, remaining)), True
-
-
-class _TurnReadingBudget:
-    """One turn's reading budget (TOOL_RESULTS_TURN_MAX_CHARS), with one
-    escape hatch.
-
-    ``_turn_result_limit`` decides the cap from what the turn has used. A
-    read cut by the budget may be the very document the question asks to
-    edit, and an edit from a cut read would drop everything past the cut.
-    So the turn gets one full re-read: when the model repeats a call the
-    budget cut, same tool and same input, the loop answers it with the
-    result it already has (``replay``), under the per-result cap, and never
-    runs the tool again. Replaying rather than re-running matters: the
-    budget cuts any tool's result, and a repeated write (an event, a
-    message) would happen twice. Once per turn, so the budget still bounds
-    the turn: at most one extra ``per_result``.
-    """
-
-    def __init__(self, *, per_result: int, turn_budget: int) -> None:
-        self.per_result = per_result
-        self.turn_budget = turn_budget
-        self.used = 0
-        # Full text of each result the budget cut, by call.
-        self._cut_results: dict[str, str] = {}
-        # tool_use ids answered by ``replay``: shown in full, not cut again.
-        self._replayed: set[str] = set()
-        self.full_reread_left = True
-
-    @staticmethod
-    def _key(name: str, tool_input: Any) -> str:
-        try:
-            return name + "\x00" + json.dumps(tool_input, sort_keys=True, default=str)
-        except (TypeError, ValueError):
-            return name + "\x00" + repr(tool_input)
-
-    def replay(self, tool_use: dict[str, Any]) -> str | None:
-        """The stored full result if ``tool_use`` repeats a call the budget
-        cut and the turn's one re-read is left; the caller then answers it
-        with this text instead of dispatching it. ``None`` otherwise."""
-        if not self.full_reread_left:
-            return None
-        full = self._cut_results.get(self._key(tool_use["name"], tool_use["input"]))
-        if full is None:
-            return None
-        self.full_reread_left = False
-        self._replayed.add(tool_use["id"])
-        return full
-
-    def cap(self, name: str, tool_input: Any, text: Any, tool_use_id: str = "") -> Any:
-        """``text`` capped for the prompt, counted against the budget."""
-        if tool_use_id and tool_use_id in self._replayed:
-            limit, budget_spent = self.per_result, False
-        else:
-            limit, budget_spent = _turn_result_limit(
-                name, per_result=self.per_result, turn_budget=self.turn_budget, used=self.used
-            )
-            if budget_spent and isinstance(text, str) and len(text) > limit:
-                self._cut_results[self._key(name, tool_input)] = text
-        content = _cap_tool_result(
-            text,
-            tool_name=name,
-            limit=limit,
-            budget_spent=budget_spent,
-            full_reread_left=self.full_reread_left,
-        )
-        if name != "consult_specialist" and isinstance(content, str):
-            self.used += len(content)
-        return content
 
 
 # The history breakpoint lives an hour: people answer in minutes, not
@@ -705,7 +500,7 @@ def _apply_loop_cache_marker(
     read the previous iteration's write and extend it, so hits accrue.
 
     The marker MOVES rather than accumulates: a per-iteration marker left
-    in place would reach ``max_iterations`` breakpoints and blow the
+    in place would reach one breakpoint per round and blow the
     4-breakpoint API limit. Sweeping first also makes this idempotent and
     self-healing — there is no bookkeeping index to drift out of sync.
 
@@ -752,6 +547,47 @@ def _apply_loop_cache_marker(
     if markable:
         markable[-1]["cache_control"] = {"type": "ephemeral"}
     return bool(markable)
+
+
+# Ids and times in a result (a request id, a timestamp, a clock, time
+# elapsed or left) don't make it a different answer: they are left out of
+# _call_key. Other numbers stay, so a status read whose progress moves
+# (20, 40, 60) is getting somewhere, and one whose only change is "42s
+# elapsed" is not.
+_VARYING_IN_A_RESULT = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
+    r"|(?<![0-9A-Za-z:])\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?![0-9A-Za-z:])"
+    r"|(?<![0-9A-Za-z.])\d+(?:\.\d+)?\s?(?:ms|s|secs?|seconds?|mins?|minutes?|h|hrs?|hours?)(?![0-9A-Za-z])"
+    r"|(?<![0-9A-Za-z])(?=[0-9-]*[a-fA-F])[0-9a-fA-F]{8,}(?:-[0-9a-fA-F]{4,})*(?![0-9A-Za-z])"
+    r"|(?<![0-9A-Za-z])(?=[0-9A-Za-z_-]*\d)(?=[0-9A-Za-z_-]*[A-Za-z])[0-9A-Za-z_-]{12,}(?![0-9A-Za-z])"
+)
+
+
+# A cut round's text that packs this small is a model repeating itself
+# ("... ... ...", one line over and over), no step of the work. Prose and
+# tables pack to a quarter or more of their length.
+_STUCK_TEXT_MIN = 2_000
+_STUCK_TEXT_RATIO = 0.05
+
+
+def _says_something(text: str) -> bool:
+    """Whether cut text is a step of the work: not empty, and not one thing
+    said over and over (it packs to almost nothing)."""
+    if not text.strip():
+        return False
+    if len(text) < _STUCK_TEXT_MIN:
+        return True
+    raw = text.encode()
+    return len(zlib.compress(raw, 6)) / len(raw) >= _STUCK_TEXT_RATIO
+
+
+def _call_key(tool_use: dict[str, Any], result: Any) -> str:
+    """One call with what it returned, for REPEAT_LIMIT: the same error with
+    a new request id or time each try is still the same result."""
+    same = _VARYING_IN_A_RESULT.sub("#", str(result))
+    return hashlib.sha256(
+        json.dumps([tool_use["name"], tool_use["input"], same], sort_keys=True, default=str).encode()
+    ).hexdigest()
 
 
 def _with_notice(result: Any, notice: str) -> Any:
@@ -1228,25 +1064,6 @@ def _emit_cache_event(
     )
 
 
-# Added after the tool results of the round before the last. The last round
-# is offered no tool (tool_choice none), so this is the turn's chance to
-# answer from what it has rather than run out of steps mid-task.
-LAST_ROUND_NOTE = (
-    "This is your last step for this message: no more tools can run. Write "
-    "your answer now from what you have gathered so far. If part of the "
-    "request is still undone, say briefly what is left, and that you can "
-    "carry on if they ask."
-)
-
-
-# The most one round of the Executive may write. Claude takes it; every other
-# model gets at most NON_CLAUDE_MAX_OUTPUT_TOKENS, and a self-hosted one
-# LOCAL_MAX_OUTPUT_TOKENS (providers.feature_gate). A round that reaches it is
-# cut off mid-answer (stop_reason "max_tokens"): a long file (a spreadsheet,
-# a document) written as one tool call stopped the whole turn before this was
-# raised from 8192. Every Executive round and the committee revision use it.
-MAX_OUTPUT_TOKENS = 32_000
-
 # Answers a tool call the model was still writing when its round was cut off
 # at MAX_OUTPUT_TOKENS: the call never ran (its input is unfinished), and the
 # turn carries on so it can make it again in a shorter form.
@@ -1268,10 +1085,46 @@ CUT_OFF_NOTE = (
 # What the person sees for a round that was cut off: the step it was on was
 # writing something long, not the read before it.
 CUT_OFF_LABEL = "Writing it in shorter parts…"
-# Cut rounds in a row a turn carries on through. One more cut than this ends
-# the turn as written: three tries at a shorter form all ran out of room, and
-# each further try would cost another full round.
-MAX_CUT_ROUNDS = 3
+# Cut rounds in a row that got nowhere after which a turn ends: a round that
+# wrote nothing at all (a model spending its whole answer thinking), or one
+# cut while writing its only call (a document too long for one call, asked
+# for again just as long), which never runs. A round whose cut fell in text,
+# or that closed a call before the cut, is a step of the work, so this never
+# stops a job that is getting written; without it the loop would bill a full
+# answer each round, forever.
+MAX_EMPTY_CUT_ROUNDS = 3
+# The same call with the same result this many times in a turn is no step
+# of the work (a write that keeps failing the same way, a retry that finds
+# nothing new): the turn then writes its answer from what it has and runs no
+# more tools. A turn that gets anywhere never meets it; it replaces a count
+# of rounds. Workflow steps follow the same rule (action_step.REPEAT_LIMIT).
+REPEAT_LIMIT = 4
+REPEATING_NOTE = (
+    "You have made the same call several times and it came back the same "
+    "each time. Do not call any more tools. Write your answer now from what "
+    "you have: say what worked, what kept failing and why, and what would fix it."
+)
+REPEATING_EMPTY_REPLY = (
+    "I stopped because the same step kept coming back the same way, and "
+    "nothing was ready to show yet."
+)
+# Once a turn has read all its model holds (TurnReadingBudget.full), more
+# reads would push the prompt past the window: it writes its answer from
+# what it has read and offers to carry on, the same way a repeat ends.
+FULL_NOTE = (
+    "This question has now read all it can hold at once. Do not call any "
+    "more tools. Write your answer now from what you have read, say plainly "
+    "what you have not read yet, and offer to carry on with the rest in a new message."
+)
+FULL_EMPTY_REPLY = (
+    "I've read all I can hold for this one question. Ask me to carry on and "
+    "I'll pick up the rest."
+)
+# Said when it ends that way.
+EMPTY_CUTS_REPLY = (
+    "I kept running out of room before I could finish a step of this. "
+    "Ask me to carry on, or to do it in smaller steps."
+)
 
 
 # Said in place of a round's results when nothing came back to put there (a
@@ -1521,7 +1374,6 @@ class Executive:
         retrieved_context: str = "",
         episodic_context: str = "",
         debug_collector: DebugCollector | None = None,
-        max_iterations: int = 15,
         attachment_blocks: list[dict[str, Any]] | None = None,
         person_id: int | None = None,
         co_present_person_ids: list[int] | None = None,
@@ -1752,7 +1604,6 @@ class Executive:
                     system_blocks,
                     messages,
                     model=effective_model,
-                    max_iterations=max_iterations,
                     episodic_context=episodic_context,
                     debug_collector=debug_collector,
                     consulted_out=consulted,
@@ -1798,7 +1649,7 @@ class Executive:
         # entry point (web stream, .chat() wrapper used by Discord / Slack
         # / Telegram / Email / Google Chat) flows through.
         # Only emit on real text — an empty response means the agent loop
-        # produced only tool_use blocks or hit max_iterations without text,
+        # produced only tool_use blocks and no text,
         # and an audit row for "" adds noise without signal.
         if full_response.strip():
             audit_log(
@@ -1977,7 +1828,6 @@ class Executive:
         retrieved_context: str = "",
         episodic_context: str = "",
         debug_collector: DebugCollector | None = None,
-        max_iterations: int = 15,
         attachment_blocks: list[dict[str, Any]] | None = None,
         person_id: int | None = None,
         co_present_person_ids: list[int] | None = None,
@@ -2190,7 +2040,6 @@ class Executive:
                 system_blocks,
                 messages,
                 model=effective_model,
-                max_iterations=max_iterations,
                 episodic_context=episodic_context,
                 debug_collector=debug_collector,
                 consulted_out=consulted,
@@ -2228,7 +2077,7 @@ class Executive:
             len(draft),
         )
 
-        # If the draft came back empty (timeout, max_iterations, etc.) skip
+        # If the draft came back empty (a timeout, a turn that wrote nothing) skip
         # review — there is nothing to critique. Still emit the remaining
         # phase events so the UI's stepper completes; otherwise it stays
         # frozen on "drafting" until the connection closes.
@@ -2554,7 +2403,6 @@ class Executive:
         system_blocks: list[dict[str, Any]],
         messages: list[dict[str, Any]],
         model: str = "",
-        max_iterations: int = 15,
         episodic_context: str = "",
         debug_collector: DebugCollector | None = None,
         consulted_out: list[str] | None = None,
@@ -2737,7 +2585,6 @@ class Executive:
         fanout_hinted = False
         # Shallow copy — the caller owns every dict up to this index.
         caller_message_count = len(current_messages)
-        last_full_text = ""
         # The end of the text this turn has streamed so far, across rounds:
         # a round's text after an earlier round's (the model's words before a
         # tool call, then its answer) starts a new paragraph, so the two
@@ -2746,14 +2593,10 @@ class Executive:
         # Set by a round cut off mid-text: the next round's text carries it
         # on, so that round alone gets no paragraph break before its text.
         run_on = False
-        cut_rounds = 0
         specialists_consulted: list[str] = []
         # What this turn's tool results have put in the prompt so far: every
         # one is re-sent on each later call.
-        reading_budget = _TurnReadingBudget(
-            per_result=self._settings.tool_result_max_chars,
-            turn_budget=self._settings.tool_results_turn_max_chars,
-        )
+        reading_budget = TurnReadingBudget(reading_limits_for(model))
 
         # Every tool call this turn with the start of its result, for the
         # end-of-turn check that the reply claims nothing it didn't do
@@ -2767,18 +2610,26 @@ class Executive:
         # Reply text of cut rounds the next round carries on: the claim
         # check reads it with the round that finishes the reply.
         cut_text = ""
+        # Cut rounds in a row that wrote nothing (MAX_EMPTY_CUT_ROUNDS).
+        empty_cuts = 0
         claim_checked = False
         # Set once the person asks to finish the work themselves: the next
         # round writes up what the turn has, and runs no tool.
         handing_over = False
+        # Set once the same call came back the same REPEAT_LIMIT times: the next
+        # round writes up what the turn has, and runs no tool, as on a hand-over.
+        repeating = False
+        # What a write-up that wrote nothing says: why it was asked for.
+        write_up_empty = REPEATING_EMPTY_REPLY
+        repeats: dict[str, int] = {}
         # What the turn last showed the person (show_progress), so each call
         # adds to it, and the reads it made, counted once each for the card.
         shown_progress: turn_progress.Progress | None = None
         turn_reads = turn_progress.Reads()
 
-        for iteration in range(1, max_iterations + 1):
+        for iteration in itertools.count(1):
             logger.info(
-                "iter %d/%d", iteration, max_iterations,
+                "iter %d", iteration,
                 extra={"iter_marker": True},
             )
             full_text = ""
@@ -2787,6 +2638,9 @@ class Executive:
             carries_on, run_on = run_on, False
             tool_uses: list[dict[str, Any]] = []
             response_content: list[dict[str, Any]] = []
+            # The content check's notice on each result this round, for every
+            # part of it (orchestrator.reading).
+            read_notices: dict[str, str] = {}
 
             # If specialists were already consulted, this is the synthesis pass.
             # Emit synthesis_start before text chunks begin streaming.
@@ -2836,12 +2690,6 @@ class Executive:
                 system=system_blocks,  # type: ignore[arg-type]
                 tools=tools_with_cache,  # type: ignore[arg-type,list-item]
                 messages=current_messages,  # type: ignore[arg-type]
-                # The last round runs no tool, so a turn that used up its
-                # steps still answers from what it gathered instead of
-                # ending on "unable to complete". The tools and system
-                # blocks stay cached; the messages are read uncached this
-                # once, as tool_choice changes. Only a turn at its cap pays it.
-                **({"tool_choice": {"type": "none"}} if iteration == max_iterations else {}),
             ) as stream:
                 async for event in stream:
                     if (
@@ -2905,8 +2753,6 @@ class Executive:
             if turn_sources is not None:
                 record_web_sources(turn_sources, final_msg.content)
 
-            last_full_text = full_text
-
             if web_search_queries:
                 session_id = getattr(current_session.get(), "session_id", None)
                 if debug_collector:
@@ -2937,14 +2783,40 @@ class Executive:
             # Cut off at MAX_OUTPUT_TOKENS mid-answer: carry on rather than
             # end the turn on half a step. A cut tool call is answered with
             # CUT_OFF_RESULT below and never runs; cut text gets CUT_OFF_NOTE.
-            # The last round runs no tool, so its reply stands as written,
-            # as does a cut after MAX_CUT_ROUNDS cut rounds in a row.
-            cut_rounds = cut_rounds + 1 if final_msg.stop_reason == "max_tokens" else 0
-            cut_off = (
-                final_msg.stop_reason == "max_tokens"
-                and iteration < max_iterations
-                and cut_rounds <= MAX_CUT_ROUNDS
+            usage = getattr(final_msg, "usage", None)
+            if usage is not None:
+                reading_budget.prompt_was(
+                    sum(
+                        int(getattr(usage, k, 0) or 0)
+                        for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+                    )
+                )
+            cut_off = final_msg.stop_reason == "max_tokens"
+            # The call the round was still writing when it was cut off is the
+            # last one; its input is unfinished, so nothing reads or runs it.
+            # Only text and calls count as written: a reasoning block that a
+            # translated provider (OpenRouter, OpenAI) puts last is skipped.
+            # A call followed by text or by a call the provider dropped closed
+            # before the cut and runs. A translated provider lists text first,
+            # so its last call always counts as cut and is asked for again.
+            last_written = next(
+                (b for b in reversed(response_content) if b.get("type") in ("text", "tool_use")),
+                None,
             )
+            # A cut round got somewhere when its cut fell in text (shown, and
+            # carried on) or a call closed before the cut (it runs). A round
+            # cut while writing its only call got nowhere, however much it
+            # wrote before it: that call never runs.
+            cut_in_call = last_written is not None and last_written.get("type") == "tool_use"
+            closed_calls = sum(b.get("type") == "tool_use" for b in response_content) - int(cut_in_call)
+            got_somewhere = closed_calls > 0 or (
+                last_written is not None and not cut_in_call and _says_something(str(last_written.get("text", "")))
+            )
+            empty_cuts = empty_cuts + 1 if cut_off and not got_somewhere else 0
+            if empty_cuts > MAX_EMPTY_CUT_ROUNDS:
+                logger.warning("round %d: %d cut rounds in a row wrote nothing; ending the turn", iteration, empty_cuts)
+                yield ("\n\n" if streamed_tail else "") + EMPTY_CUTS_REPLY
+                return
             if cut_off:
                 logger.warning(
                     "round %d cut off at max_tokens=%d; carrying on", iteration, MAX_OUTPUT_TOKENS,
@@ -2959,11 +2831,13 @@ class Executive:
                     cut_text += "".join(
                         str(b.get("text", "")) for b in response_content if b.get("type") == "text"
                     )
+                    if reading_budget.window_full:
+                        # Another cut round would not fit the window: what
+                        # it wrote stays shown and the turn ends plainly.
+                        logger.warning("round %d cut off with the window full; ending the turn", iteration)
+                        yield ("\n\n" if streamed_tail else "") + FULL_EMPTY_REPLY
+                        return
                     note: list[dict[str, Any]] = [{"type": "text", "text": CUT_OFF_NOTE}]
-                    # The next round is the last and runs no tool: say so, as
-                    # after any other round.
-                    if iteration == max_iterations - 1:
-                        note.append({"type": "text", "text": LAST_ROUND_NOTE})
                     current_messages.append({"role": "user", "content": note})
                     # The next round carries on the cut text where it
                     # stopped: no paragraph break between them
@@ -2993,7 +2867,7 @@ class Executive:
                     return
                 # Do what it says: a reply that claims a change no call this
                 # turn made gets one more round to make it or say it can't.
-                if claim_checked or handing_over or iteration >= max_iterations:
+                if claim_checked or handing_over or repeating:
                     return
                 claim_checked = True
                 reply_text = cut_text + "\n".join(
@@ -3024,23 +2898,19 @@ class Executive:
                 nudge: list[dict[str, Any]] = [
                     {"type": "text", "text": claim_check.nudge(claim)}
                 ]
-                # The retry is the last round, which runs no tool: say so,
-                # so it says it can't rather than try a call it won't get.
-                if iteration == max_iterations - 1:
-                    nudge.append({"type": "text", "text": LAST_ROUND_NOTE})
                 current_messages.append({"role": "user", "content": nudge})
                 # The retry's text gets its paragraph break from
                 # _round_separator, like any other round's.
                 continue
 
-            # Handed over: the write-up asked for a tool anyway. Run nothing;
-            # what it wrote (if anything) is the reply.
-            if handing_over:
+            # Handed over (or repeating itself): the write-up asked for a tool
+            # anyway. Run nothing; what it wrote (if anything) is the reply.
+            if handing_over or repeating:
                 if not any(
                     b.get("type") == "text" and str(b.get("text", "")).strip()
                     for b in response_content
                 ):
-                    yield HAND_OVER_EMPTY_REPLY
+                    yield HAND_OVER_EMPTY_REPLY if handing_over else write_up_empty
                 return
 
             cut_text = ""
@@ -3050,17 +2920,6 @@ class Executive:
             # show_progress is answered here too: nothing runs, and the chat
             # gets it before this round's activity label.
             group_results: dict[str, str] = {}
-            # The call the round was still writing when it was cut off is the
-            # last one; its input is unfinished, so nothing reads or runs it.
-            # Only text and calls count as written: a reasoning block that a
-            # translated provider (OpenRouter, OpenAI) puts last is skipped.
-            # A call followed by text or by a call the provider dropped closed
-            # before the cut and runs. A translated provider lists text first,
-            # so its last call always counts as cut and is asked for again.
-            last_written = next(
-                (b for b in reversed(response_content) if b.get("type") in ("text", "tool_use")),
-                None,
-            )
             cut_id = (
                 tool_uses[-1]["id"]
                 if cut_off and tool_uses and last_written is not None
@@ -3105,9 +2964,9 @@ class Executive:
                     own = _own_tool_call(tu, turn_handlers)
                     if own is not None:
                         tool_uses[i] = own
-            # The turn's one full re-read of a result the reading budget cut
-            # is answered from that result, never by running the tool again
-            # (it may have been a write).
+            # A repeat of a call whose result came back in parts is answered
+            # with its next part, never by running the tool again (it may
+            # have been a write).
             for tu in tool_uses:
                 if tu["id"] not in group_results:
                     replayed = reading_budget.replay(tu)
@@ -3543,7 +3402,10 @@ class Executive:
                 feed = turn_live.Feed()
                 with feed.bound():
                     skill_task = asyncio.ensure_future(asyncio.gather(
-                        *(turn_handlers[tu["name"]](tu["input"]) for tu in skill_tool_uses),
+                        *(
+                            with_turn_limits(reading_budget.limits, turn_handlers[tu["name"]](tu["input"]))
+                            for tu in skill_tool_uses
+                        ),
                         return_exceptions=True,
                     ))
                 # Closed here, so a turn that stops at a yield cancels the
@@ -3870,7 +3732,7 @@ class Executive:
                     source = outside_content.source_of(probe_name, probe_input)
                     try:
                         if own:
-                            text = str(await _handlers[tool](arguments))
+                            text = str(await with_turn_limits(reading_budget.limits, _handlers[tool](arguments)))
                         else:
                             text = str(await _call({"name": tool, "arguments": arguments}))
                     except asyncio.CancelledError:
@@ -4052,7 +3914,8 @@ class Executive:
                             elif kind == "done":
                                 script_result, script_failed = payload
                     logger.info("← run_script  result=%s", _trunc(script_result))
-                    results_by_id[tu["id"]] = "".join(dict.fromkeys(notices)) + script_result
+                    read_notices[tu["id"]] = "".join(dict.fromkeys(notices))
+                    results_by_id[tu["id"]] = read_notices[tu["id"]] + script_result
                     # Agent Activity: the built tool as one card, with the
                     # calls it made (the result lists them, capped). Sent by
                     # the round's event replay below, like specialist events.
@@ -4138,6 +4001,7 @@ class Executive:
                     )
                     if notice:
                         results_by_id[tu["id"]] = _with_notice(results_by_id.get(tu["id"], ""), notice)
+                        read_notices[tu["id"]] = notice
             # The owner's own mail this round read is checked the same way,
             # and decides how much of the Act as me lockdown holds from the
             # next round on (delegation.lockdown.mail_lock_holds).
@@ -4153,6 +4017,9 @@ class Executive:
                     results_by_id[tu["id"]] = checked
                     if notice:
                         results_by_id[tu["id"]] = _with_notice(results_by_id.get(tu["id"], ""), notice)
+                        # Before the content check's notice, as _with_notice
+                        # put them, so every later part carries both.
+                        read_notices[tu["id"]] = notice + read_notices.get(tu["id"], "")
                 # A script that ran beside the read may have read mail the
                 # loop never checks: the turn stays unvetted.
                 ran_script = any(
@@ -4174,12 +4041,16 @@ class Executive:
                 claim_calls.append(
                     (claim_check.call_label(tu["name"], tu["input"]), str(results_by_id.get(tu["id"], "")))
                 )
+            # A call that may have changed something drops the parts held
+            # from before it (orchestrator.reading).
+            reading_budget.ran(tool_uses)
             for tu in tool_uses:
                 content = reading_budget.cap(
                     tu["name"],
                     tu["input"],
                     app_links.for_model(results_by_id.get(tu["id"], f"Unknown tool: {tu['name']}")),
                     tu["id"],
+                    read_notices.get(tu["id"], ""),
                 )
                 content = tool_images.content(content, images_by_id.get(tu["id"]), sees=sees)
                 tool_results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": content})
@@ -4217,14 +4088,22 @@ class Executive:
                 # Audited by the inbox's owner (the web chat route), under
                 # the same privacy as the turn's own message.
                 yield {"type": "message_added", "ids": [m.id for m in added]}
-            # The last round has no step after it to write anything up in;
-            # its own reply stands, and the request is never taken.
-            if iteration < max_iterations and inbox is not None and inbox.take_hand_over():
+            if inbox is not None and inbox.take_hand_over():
                 tool_results.append({"type": "text", "text": HAND_OVER_NOTE})
                 handing_over = True
                 yield {"type": "handing_over"}
-            if iteration == max_iterations - 1 and not handing_over:
-                tool_results.append({"type": "text", "text": LAST_ROUND_NOTE})
+            for tu in tool_uses:
+                key = _call_key(tu, results_by_id.get(tu["id"], ""))
+                repeats[key] = repeats.get(key, 0) + 1
+            if not handing_over and max(repeats.values(), default=0) >= REPEAT_LIMIT:
+                logger.warning("round %d: a call came back the same %d times; writing up", iteration, REPEAT_LIMIT)
+                tool_results.append({"type": "text", "text": REPEATING_NOTE})
+                repeating = True
+            elif not handing_over and not repeating and reading_budget.full:
+                logger.info("round %d: the turn has read all its model holds; writing up", iteration)
+                tool_results.append({"type": "text", "text": FULL_NOTE})
+                repeating = True
+                write_up_empty = FULL_EMPTY_REPLY
             if sees:
                 # Only the newest screenshots ride along: older ones would be
                 # sent again every round.
@@ -4245,16 +4124,12 @@ class Executive:
                 _clear_turn_marker(turn_marked)
                 turn_marked = None
 
-        logger.warning("max_iterations=%d reached — returning partial result", max_iterations)
-        yield last_full_text or "I was unable to complete the analysis. Please try again."
-
     async def chat(
         self,
         user_message: str,
         session: Session,
         retrieved_context: str = "",
         episodic_context: str = "",
-        max_iterations: int = 15,
         committee_review: bool = False,
         debug_collector: DebugCollector | None = None,
         attachment_blocks: list[dict[str, Any]] | None = None,
@@ -4310,7 +4185,6 @@ class Executive:
             "retrieved_context": retrieved_context,
             "episodic_context": episodic_context,
             "debug_collector": debug_collector,
-            "max_iterations": max_iterations,
             "attachment_blocks": attachment_blocks,
             "person_id": person_id,
             "co_present_person_ids": co_present_person_ids,

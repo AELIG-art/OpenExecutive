@@ -42,6 +42,12 @@ def fake_pdf(monkeypatch: pytest.MonkeyPatch) -> list[bytes | Path]:
     return seen
 
 
+def _parts_of(per_read: int):
+    from openexecutive.providers.feature_gate import ReadingLimits
+
+    return lambda _model="": ReadingLimits(per_read=per_read, per_turn=per_read * 2)
+
+
 def _error(out: str) -> str:
     return json.loads(out)["error"]
 
@@ -127,8 +133,8 @@ async def test_an_unreadable_pdf_says_why(dirs, monkeypatch) -> None:
     assert _error(out) == "no text could be read: OCR is off"
 
 
-async def test_long_text_is_capped(dirs, monkeypatch) -> None:
-    monkeypatch.setenv("TOOL_RESULT_MAX_CHARS", "1000")
+async def test_long_text_is_read_in_parts(dirs, monkeypatch) -> None:
+    monkeypatch.setattr("openexecutive.providers.registry.reading_limits_for", _parts_of(1000))
     downloads, _ = dirs
     (downloads / "long.txt").write_text("x" * 5000)
 
@@ -144,7 +150,7 @@ async def test_a_long_word_file_is_read_on_in_parts(dirs, monkeypatch) -> None:
     # part was cut off, so its end never needs a Python job.
     import re
 
-    monkeypatch.setenv("TOOL_RESULT_MAX_CHARS", "1000")
+    monkeypatch.setattr("openexecutive.providers.registry.reading_limits_for", _parts_of(1000))
     downloads, _ = dirs
     text = "".join(f"line {i:04d}\n" for i in range(500))
     (downloads / "psa.txt").write_text(text)
@@ -191,7 +197,7 @@ async def test_a_long_page_range_reads_on_with_the_same_pages(dirs, monkeypatch)
         return pdf_reader.PdfReadResult("y" * 5000, "text", 0)
 
     monkeypatch.setattr(pdf_reader, "read_pdf_text", fake_read)
-    monkeypatch.setenv("TOOL_RESULT_MAX_CHARS", "1000")
+    monkeypatch.setattr("openexecutive.providers.registry.reading_limits_for", _parts_of(1000))
     writer = PdfWriter()
     for _ in range(30):
         writer.add_blank_page(width=612, height=792)
@@ -203,3 +209,30 @@ async def test_a_long_page_range_reads_on_with_the_same_pages(dirs, monkeypatch)
     out = await handle_read_document({"path": str(downloads / "deck.pdf"), "pages": "11-20"})
 
     assert "call again with pages='11-20' and start=" in out
+
+
+async def test_a_part_is_what_the_turns_own_model_holds(dirs, monkeypatch) -> None:
+    """Inside a turn the part follows that turn's model, not the default one."""
+    from openexecutive.orchestrator.reading import turn_limits, with_turn_limits
+    from openexecutive.providers.feature_gate import ReadingLimits
+
+    monkeypatch.setattr("openexecutive.providers.registry.reading_limits_for", _parts_of(100_000))
+    downloads, _ = dirs
+    (downloads / "long.txt").write_text("x" * 5000)
+
+    out = await with_turn_limits(
+        ReadingLimits(per_read=1000, per_turn=2000), handle_read_document({"path": str(downloads / "long.txt")})
+    )
+
+    assert len(out) <= 1000 and "call again with start=" in out
+    assert turn_limits() is None  # bound for that call only
+
+
+async def test_a_part_of_text_written_a_token_a_character_is_a_third_as_long(dirs, monkeypatch) -> None:
+    monkeypatch.setattr("openexecutive.providers.registry.reading_limits_for", _parts_of(3000))
+    downloads, _ = dirs
+    (downloads / "jp.txt").write_text("契約" * 5000)
+
+    out = await handle_read_document({"path": str(downloads / "jp.txt")})
+
+    assert len(out) <= 1000 and "call again with start=" in out
