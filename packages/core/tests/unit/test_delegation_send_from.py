@@ -336,10 +336,69 @@ def test_chat_app_card_names_the_executive(
 ) -> None:
     from openexecutive.integrations import channel_cards
 
+    def labelled() -> tuple[tuple[str, str], ...]:
+        options = channel_cards.card_options(card.id, "")
+        return tuple((label, channel_cards.choice_of(data)) for label, data in options)
+
     mailbox, card = _card(owner)
-    assert channel_cards.card_buttons(card.id)[0] == "Send"
+    assert labelled() == (
+        ("Send from me", "a"), ("Send from Open Executive, cc me", "x"), ("Skip", "s"),
+    )
     _switch(card, mailbox, owner, True)
-    assert channel_cards.card_buttons(card.id)[0] == "Send from Executive"
+    assert labelled() == (
+        ("Send from Open Executive, cc me", "a"), ("Send from me", "x"), ("Skip", "s"),
+    )
+
+
+def test_a_chat_tap_switches_the_sender_and_shows_the_new_card(
+    db: Path, owner: Any, models: dict[str, Any], rewrites: list[str], sends: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.integrations import channel_cards
+
+    mailbox, card = _card(owner)
+    _in_this_mailbox(monkeypatch, mailbox)
+    shown = channel_cards.card_text(card.id) or ""
+    tapped = asyncio.run(channel_cards.tap(
+        channel_cards.Choice(card.id, channel_cards.SWITCH, channel_cards.version(card.id, shown)), owner,
+    ))
+    assert tapped.line == "Changed who it goes from. Check it, then send it."
+    assert "this reply from Open Executive, with you on cc." in tapped.text
+    assert tapped.options[0] == (
+        "Send from Open Executive, cc me", channel_cards.callback_data(card.id, "a", tapped.text),
+    )
+    # The old card's Send from me now only shows the card as it is.
+    stale = channel_cards.Choice(card.id, channel_cards.APPROVE, channel_cards.version(card.id, shown))
+    assert asyncio.run(channel_cards.tap(stale, owner)).line == channel_cards.CHANGED
+    # A switch sends nothing.
+    assert sends == [] and _fresh(card).status == "proposed"
+
+
+def test_a_chat_tap_switches_only_while_as_you_is_on(
+    db: Path, owner: Any, models: dict[str, Any], rewrites: list[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.delegation.settings import set_enabled
+    from openexecutive.integrations import channel_cards
+
+    mailbox, card = _card(owner)
+    _in_this_mailbox(monkeypatch, mailbox)
+    set_enabled(owner.id, False, updated_by="test")
+    shown = channel_cards.card_text(card.id) or ""
+    tapped = asyncio.run(channel_cards.tap(
+        channel_cards.Choice(card.id, channel_cards.SWITCH, channel_cards.version(card.id, shown)), owner,
+    ))
+    # The same answer as the web card's: nothing rewritten.
+    assert tapped.line == "Not done: Turn on As you to change this reply here."
+    assert rewrites == [] and inbox.card_payload(_fresh(card)).get(send_from.FROM_EXECUTIVE) is not True
+
+
+def _in_this_mailbox(monkeypatch: pytest.MonkeyPatch, mailbox: Any) -> None:
+    switch = send_from.switch
+
+    async def in_this_mailbox(instance: Any, **kwargs: Any) -> dict[str, Any]:
+        return await switch(instance, **kwargs, gmail=mailbox)
+
+    monkeypatch.setattr(send_from, "switch", in_this_mailbox)
 
 
 def test_not_on_a_card_going_on_its_own(db: Path, owner: Any, models: dict[str, Any], rewrites: list[str]) -> None:
