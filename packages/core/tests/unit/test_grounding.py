@@ -386,8 +386,26 @@ async def test_tool_results_ground_later_prose(sources: list[GroundingSource]) -
     handlers = scope.guard({"lookup_person": _lookup, "message_person": _send})
     msg = {"person_id": 7, "text": "Marcus Lee: Dana needs the lease checked."}
     assert "error" in json.loads(await handlers["message_person"](msg))
-    await handlers["lookup_person"]({"query": "property manager"})
+    # Running the lookup grounds nothing; what the model was sent does.
+    found = await handlers["lookup_person"]({"query": "property manager"})
+    assert "error" in json.loads(await handlers["message_person"](msg))
+    scope.read({"name": "lookup_person"}, found)
     assert json.loads(await handlers["message_person"](msg)) == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_read_back_grounds_nothing(sources: list[GroundingSource]) -> None:
+    async def _send(_tool_input: dict[str, Any]) -> str:
+        return json.dumps({"ok": True})
+
+    scope = GroundingScope(sources, [], surface="test")
+    handlers = scope.guard({"message_person": _send})
+    msg = {"person_id": 7, "text": "Marcus Lee owes $40k."}
+    refused = await handlers["message_person"](msg)
+    assert "error" in json.loads(refused)
+    # The refusal quotes the draft back; the model reading it is no evidence.
+    scope.read({"name": "message_person"}, refused)
+    assert "error" in json.loads(await handlers["message_person"](msg))
 
 
 @pytest.mark.asyncio

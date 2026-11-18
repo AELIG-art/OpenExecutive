@@ -9,7 +9,6 @@ import logging
 import re
 import time
 import uuid
-import zlib
 from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -165,7 +164,19 @@ from openexecutive.orchestrator.people_tools import (
     is_principal_on_verified_surface,
     turn_is_private_to_principal,
 )
-from openexecutive.orchestrator.reading import TurnReadingBudget, with_turn_limits
+from openexecutive.orchestrator.reading import (
+    CUT_OFF_NOTE,
+    CUT_OFF_RESULT,
+    FULL_NOTE,
+    MAX_EMPTY_CUT_ROUNDS,
+    REPEAT_LIMIT,
+    REPEATING_NOTE,
+    TurnReadingBudget,
+    apply_loop_cache_marker,
+    last_written_block,
+    says_something,
+    with_turn_limits,
+)
 from openexecutive.orchestrator.research_tools import (
     RESEARCH_TOOL_HANDLERS,
     RESEARCH_TOOLS,
@@ -373,7 +384,7 @@ def _apply_history_cache_marker(
     stored as plain text and rebuilt identically every turn, so on the next
     message everything up to that point is a cache read, and only what is
     new (the last exchange, this turn's context) is written. Without it the
-    loop marker (``_apply_loop_cache_marker``) writes the whole history again
+    loop marker (``apply_loop_cache_marker``) writes the whole history again
     on every turn, because the previous turn's cached prefix ended inside
     that turn's own context and tool calls, which history does not keep.
 
@@ -485,109 +496,6 @@ def _clear_turn_marker(message: dict[str, Any] | None) -> None:
     for block in message.get("content") or []:
         if isinstance(block, dict):
             block.pop("cache_control", None)
-
-
-def _apply_loop_cache_marker(
-    messages: list[dict[str, Any]], start: int = 0
-) -> bool:
-    """Move the agent loop's intra-turn cache breakpoint to the newest
-    tool result, in place.
-
-    Without this the loop caches only the static tools+system prefix, so
-    every iteration re-sends the whole accumulated transcript at full
-    input price and ``cache_read_input_tokens`` stays pinned flat while
-    the prompt grows. Marking the newest tool result makes each iteration
-    read the previous iteration's write and extend it, so hits accrue.
-
-    The marker MOVES rather than accumulates: a per-iteration marker left
-    in place would reach one breakpoint per round and blow the
-    4-breakpoint API limit. Sweeping first also makes this idempotent and
-    self-healing — there is no bookkeeping index to drift out of sync.
-
-    Placement is the newest non-empty ``tool_result`` in a user message.
-    That is normally the last block of the last user message; when the
-    newest results are empty it falls back to the newest non-empty one
-    before them, so an all-empty iteration still gets a breakpoint. Only
-    the empty blocks then sit outside the cached prefix, which costs
-    nothing.
-
-    The marker must stay at the ``tool_result`` block's own top level:
-    ``providers.feature_gate._strip_cache_control`` removes markers one
-    level deep only, so a marker nested inside ``tool_result["content"]``
-    would survive the gate and reach a provider that rejects the field.
-
-    ``start`` bounds the sweep to messages this loop appended. The loop's
-    ``current_messages`` is a SHALLOW copy, so the caller still owns the
-    dicts before that index; without the bound a caller-supplied
-    ``tool_result`` would be mutated in place. Today no caller builds one,
-    but making that structural beats guarding it with a comment.
-    """
-    # Sweep every marker, and remember every markable block in order. The
-    # newest one wins, but keeping the whole list means an iteration whose
-    # last results are all empty falls back to the newest earlier result
-    # rather than shipping with no breakpoint at all — losing the marker
-    # costs the entire accumulated transcript at full price for that step.
-    markable: list[dict[str, Any]] = []
-    for msg in messages[start:]:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        is_user = msg.get("role") == "user"
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
-            block.pop("cache_control", None)
-            # An empty result carries nothing worth caching and risks an
-            # upstream 400 on the translated typed block. Non-str content
-            # (a typed/image result) is markable — it is real bytes in the
-            # prefix — but is left to the translator to render.
-            body = block.get("content")
-            if is_user and body:
-                markable.append(block)
-    if markable:
-        markable[-1]["cache_control"] = {"type": "ephemeral"}
-    return bool(markable)
-
-
-# Ids and times in a result (a request id, a timestamp, a clock, time
-# elapsed or left) don't make it a different answer: they are left out of
-# _call_key. Other numbers stay, so a status read whose progress moves
-# (20, 40, 60) is getting somewhere, and one whose only change is "42s
-# elapsed" is not.
-_VARYING_IN_A_RESULT = re.compile(
-    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
-    r"|(?<![0-9A-Za-z:])\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?![0-9A-Za-z:])"
-    r"|(?<![0-9A-Za-z.])\d+(?:\.\d+)?\s?(?:ms|s|secs?|seconds?|mins?|minutes?|h|hrs?|hours?)(?![0-9A-Za-z])"
-    r"|(?<![0-9A-Za-z])(?=[0-9-]*[a-fA-F])[0-9a-fA-F]{8,}(?:-[0-9a-fA-F]{4,})*(?![0-9A-Za-z])"
-    r"|(?<![0-9A-Za-z])(?=[0-9A-Za-z_-]*\d)(?=[0-9A-Za-z_-]*[A-Za-z])[0-9A-Za-z_-]{12,}(?![0-9A-Za-z])"
-)
-
-
-# A cut round's text that packs this small is a model repeating itself
-# ("... ... ...", one line over and over), no step of the work. Prose and
-# tables pack to a quarter or more of their length.
-_STUCK_TEXT_MIN = 2_000
-_STUCK_TEXT_RATIO = 0.05
-
-
-def _says_something(text: str) -> bool:
-    """Whether cut text is a step of the work: not empty, and not one thing
-    said over and over (it packs to almost nothing)."""
-    if not text.strip():
-        return False
-    if len(text) < _STUCK_TEXT_MIN:
-        return True
-    raw = text.encode()
-    return len(zlib.compress(raw, 6)) / len(raw) >= _STUCK_TEXT_RATIO
-
-
-def _call_key(tool_use: dict[str, Any], result: Any) -> str:
-    """One call with what it returned, for REPEAT_LIMIT: the same error with
-    a new request id or time each try is still the same result."""
-    same = _VARYING_IN_A_RESULT.sub("#", str(result))
-    return hashlib.sha256(
-        json.dumps([tool_use["name"], tool_use["input"], same], sort_keys=True, default=str).encode()
-    ).hexdigest()
 
 
 def _with_notice(result: Any, notice: str) -> Any:
@@ -1064,57 +972,12 @@ def _emit_cache_event(
     )
 
 
-# Answers a tool call the model was still writing when its round was cut off
-# at MAX_OUTPUT_TOKENS: the call never ran (its input is unfinished), and the
-# turn carries on so it can make it again in a shorter form.
-CUT_OFF_RESULT = (
-    "That call was cut off at the length limit before you finished writing "
-    "it, so it did not run. Make it again in a shorter form, or in smaller "
-    "steps (for example, fewer rows or columns first, then the rest)."
-)
-
-# Said after a round cut off at MAX_OUTPUT_TOKENS with no tool call left to
-# answer (cut in its reply text, or a cut call the provider dropped whole).
-CUT_OFF_NOTE = (
-    "Your last answer was cut off at the length limit before it finished. If "
-    "you were writing a tool call, it did not run: make it again in a shorter "
-    "form, or in smaller steps. If you were writing your reply, carry on from "
-    "where it stopped, without repeating what you already wrote."
-)
-
 # What the person sees for a round that was cut off: the step it was on was
 # writing something long, not the read before it.
 CUT_OFF_LABEL = "Writing it in shorter parts…"
-# Cut rounds in a row that got nowhere after which a turn ends: a round that
-# wrote nothing at all (a model spending its whole answer thinking), or one
-# cut while writing its only call (a document too long for one call, asked
-# for again just as long), which never runs. A round whose cut fell in text,
-# or that closed a call before the cut, is a step of the work, so this never
-# stops a job that is getting written; without it the loop would bill a full
-# answer each round, forever.
-MAX_EMPTY_CUT_ROUNDS = 3
-# The same call with the same result this many times in a turn is no step
-# of the work (a write that keeps failing the same way, a retry that finds
-# nothing new): the turn then writes its answer from what it has and runs no
-# more tools. A turn that gets anywhere never meets it; it replaces a count
-# of rounds. Workflow steps follow the same rule (action_step.REPEAT_LIMIT).
-REPEAT_LIMIT = 4
-REPEATING_NOTE = (
-    "You have made the same call several times and it came back the same "
-    "each time. Do not call any more tools. Write your answer now from what "
-    "you have: say what worked, what kept failing and why, and what would fix it."
-)
 REPEATING_EMPTY_REPLY = (
     "I stopped because the same step kept coming back the same way, and "
     "nothing was ready to show yet."
-)
-# Once a turn has read all its model holds (TurnReadingBudget.full), more
-# reads would push the prompt past the window: it writes its answer from
-# what it has read and offers to carry on, the same way a repeat ends.
-FULL_NOTE = (
-    "This question has now read all it can hold at once. Do not call any "
-    "more tools. Write your answer now from what you have read, say plainly "
-    "what you have not read yet, and offer to carry on with the rest in a new message."
 )
 FULL_EMPTY_REPLY = (
     "I've read all I can hold for this one question. Ask me to carry on and "
@@ -2621,7 +2484,6 @@ class Executive:
         repeating = False
         # What a write-up that wrote nothing says: why it was asked for.
         write_up_empty = REPEATING_EMPTY_REPLY
-        repeats: dict[str, int] = {}
         # What the turn last showed the person (show_progress), so each call
         # adds to it, and the reads it made, counted once each for the card.
         shown_progress: turn_progress.Progress | None = None
@@ -2783,14 +2645,7 @@ class Executive:
             # Cut off at MAX_OUTPUT_TOKENS mid-answer: carry on rather than
             # end the turn on half a step. A cut tool call is answered with
             # CUT_OFF_RESULT below and never runs; cut text gets CUT_OFF_NOTE.
-            usage = getattr(final_msg, "usage", None)
-            if usage is not None:
-                reading_budget.prompt_was(
-                    sum(
-                        int(getattr(usage, k, 0) or 0)
-                        for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-                    )
-                )
+            reading_budget.saw(getattr(final_msg, "usage", None))
             cut_off = final_msg.stop_reason == "max_tokens"
             # The call the round was still writing when it was cut off is the
             # last one; its input is unfinished, so nothing reads or runs it.
@@ -2799,10 +2654,7 @@ class Executive:
             # A call followed by text or by a call the provider dropped closed
             # before the cut and runs. A translated provider lists text first,
             # so its last call always counts as cut and is asked for again.
-            last_written = next(
-                (b for b in reversed(response_content) if b.get("type") in ("text", "tool_use")),
-                None,
-            )
+            last_written = last_written_block(response_content)
             # A cut round got somewhere when its cut fell in text (shown, and
             # carried on) or a call closed before the cut (it runs). A round
             # cut while writing its only call got nowhere, however much it
@@ -2810,7 +2662,7 @@ class Executive:
             cut_in_call = last_written is not None and last_written.get("type") == "tool_use"
             closed_calls = sum(b.get("type") == "tool_use" for b in response_content) - int(cut_in_call)
             got_somewhere = closed_calls > 0 or (
-                last_written is not None and not cut_in_call and _says_something(str(last_written.get("text", "")))
+                last_written is not None and not cut_in_call and says_something(str(last_written.get("text", "")))
             )
             empty_cuts = empty_cuts + 1 if cut_off and not got_somewhere else 0
             if empty_cuts > MAX_EMPTY_CUT_ROUNDS:
@@ -4093,9 +3945,8 @@ class Executive:
                 handing_over = True
                 yield {"type": "handing_over"}
             for tu in tool_uses:
-                key = _call_key(tu, results_by_id.get(tu["id"], ""))
-                repeats[key] = repeats.get(key, 0) + 1
-            if not handing_over and max(repeats.values(), default=0) >= REPEAT_LIMIT:
+                reading_budget.came_back(tu["name"], tu["input"], results_by_id.get(tu["id"], ""))
+            if not handing_over and reading_budget.repeating:
                 logger.warning("round %d: a call came back the same %d times; writing up", iteration, REPEAT_LIMIT)
                 tool_results.append({"type": "text", "text": REPEATING_NOTE})
                 repeating = True
@@ -4118,7 +3969,7 @@ class Executive:
             # Bounded to the messages this loop appended: current_messages
             # is a shallow copy, so anything at a lower index is still owned
             # by the caller and must not be mutated.
-            if self._settings.enable_caching and _apply_loop_cache_marker(
+            if self._settings.enable_caching and apply_loop_cache_marker(
                 current_messages, caller_message_count
             ):
                 _clear_turn_marker(turn_marked)
