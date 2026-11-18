@@ -162,6 +162,12 @@ def test_an_amount_is_money(text: str) -> None:
         "document_id": "d" * 30, "end_of_segment": True,
         "text": "Post drafts. No sign-up numbers; terms of the license stay as they are."}),
     ("google_workspace__modify_doc_text", {"document_id": "d" * 30, "text": "We should hire a second engineer."}),
+    # An address written into the copy reaches no one: still the team's file.
+    ("google_workspace__create_doc", {
+        "title": "Main page copy",
+        "content": "Plans from $49 a month. Questions? Write to help@far.example. Terms apply."}),
+    ("google_workspace__modify_doc_text", {
+        "document_id": "d" * 30, "text": "Contract questions go to legal@far.example."}),
 ])
 def test_words_inside_a_team_file_are_not_what_the_step_is_about(
     owner: Any, tool: str, tool_input: dict[str, Any]
@@ -183,6 +189,22 @@ def test_a_team_files_name_and_who_it_reaches_still_count(owner: Any) -> None:
     shared = {"document_id": "d" * 30, "text": "Pay $4,000", "share_with": "stranger@far.example"}
     hit = ttl.check("google_workspace__modify_doc_text", shared, lead=_lead(), rules=[], mcp=True)
     assert hit is not None and hit.kind == "money"
+    # A share reaches whoever it names, nested too (Microsoft 365 puts them in ``body``).
+    share = {"driveId": "d1", "driveItemId": "i1", "body": {"recipients": [{"email": "bob@far.example"}],
+                                                          "roles": ["read"]}}
+    for tool in ("microsoft_365__share-drive-item", "microsoft_365__update-drive-item"):
+        assert "bob@far.example" in ttl._reach_addresses(tool, share), tool
+        assert not ttl._team_only(tool, share), tool
+    hit = ttl.check("microsoft_365__share-drive-item", share, lead=_lead(), rules=[], mcp=True)
+    assert hit is not None
+    # Who approves a held write still sees every address it names: one
+    # naming someone outside the team stays the principal's to approve.
+    named = {"document_id": "d" * 30, "text": "Renewal terms from jane@client.example"}
+    assert ttl._writes_team_file("google_workspace__modify_doc_text", named)
+    assert not ttl._team_only("google_workspace__modify_doc_text", named)
+    # An address in a comment is a mention, which emails that person.
+    comment = {"document_id": "d" * 30, "comment_content": "+bob@far.example please look"}
+    assert not ttl._team_only("google_workspace__create_doc_comment", comment)
 
 
 def test_a_team_files_known_name_counts_when_the_step_gives_only_an_id(
@@ -233,6 +255,18 @@ def test_added_rules_always_hold(owner: Any, kind: str, value: str, text: str) -
     hit = ttl.check("message_person", {"person_id": 1, "text": text}, lead=everything_off,
                     rules=ttl.list_rules([ttl.SCOPE_COMPANY]))
     assert hit is not None and hit.rule_id == rule.id
+
+
+@pytest.mark.parametrize(("kind", "value"), [("person", "bob@rival.example"), ("domain", "rival.example")])
+def test_a_wait_rule_sees_an_address_written_into_a_team_file(owner: Any, kind: str, value: str) -> None:
+    """Your rules see every address a step names, even where the level's
+    checks treat the file write as the team's own."""
+    rule = ttl.add_rule(ttl.SCOPE_COMPANY, kind, value, created_by="t")
+    write = {"document_id": "d" * 30, "text": "Forward the pricing to bob@rival.example"}
+    hit = ttl.check("google_workspace__modify_doc_text", write, lead=_lead(),
+                    rules=ttl.list_rules([ttl.SCOPE_COMPANY]), mcp=True)
+    assert hit is not None and hit.rule_id == rule.id
+    assert ttl.check("google_workspace__modify_doc_text", write, lead=_lead(), rules=[], mcp=True) is None
 
 
 @pytest.mark.parametrize(("kind", "value"), [("person", "ceo@acme.example"), ("domain", "acme.example"),

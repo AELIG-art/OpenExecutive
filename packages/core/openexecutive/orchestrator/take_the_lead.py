@@ -609,11 +609,15 @@ def _team_only(tool: str, tool_input: dict[str, Any]) -> bool:
     """Whether everyone the action reaches is on the team. Anyone else (a
     contact, someone unknown) is the principal's to approve: only their
     approval opens contact egress, and contacts are private to them."""
+    addresses, _ = _targets(tool, tool_input)
+    return _all_team([*_EMAIL_RE.findall("\n".join(_strings(tool_input))), *addresses])
+
+
+def _all_team(addresses: list[str]) -> bool:
+    """Whether every address is a teammate's. Fails closed."""
     from openexecutive.people.store import find_person_by_address
 
-    addresses, _ = _targets(tool, tool_input)
-    text = "\n".join(_strings(tool_input))
-    for address in {a.lower() for a in [*_EMAIL_RE.findall(text), *addresses]}:
+    for address in {a.lower() for a in addresses}:
         try:
             person = find_person_by_address(address, include_contacts=True)
         except Exception:
@@ -621,6 +625,39 @@ def _team_only(tool: str, tool_input: dict[str, Any]) -> bool:
         if person is None or person.kind != "team":
             return False
     return True
+
+
+def _reach_addresses(tool: str, tool_input: dict[str, Any]) -> list[str]:
+    """The addresses a step reaches: every one it names, and who an
+    id-addressed tool reaches. A write into a file reaches no one by the
+    words it puts there (a contact line in website copy): only the arguments
+    that share or send it count (``_MCP_REACH_ARG_RE``, ``_MCP_PEOPLE_KEYS``,
+    ``_MCP_RECIPIENT_KEYS``)."""
+    addresses, _ = _targets(tool, tool_input)
+    named: Any = tool_input
+    # A share, permission or delete step reaches whoever it names anywhere,
+    # and so does a comment (an address in it is a mention that emails them).
+    if (
+        _file_tool(tool) and not _MAIL_TOOL_RE.search(tool) and not _COMMENT_TOOL_RE.search(tool)
+        and not _mcp_deletes(tool, tool_input)
+    ):
+        named = list(_reach_args(tool_input))
+    return [*_EMAIL_RE.findall("\n".join(_strings(named))), *addresses]
+
+
+def _reach_args(value: Any) -> Iterator[Any]:
+    """The values of every argument, at any depth, whose name says it
+    reaches or opens to someone (Microsoft 365 puts a share's recipients
+    inside ``body``)."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if _MCP_REACH_ARG_RE.search(str(k)) or k in _MCP_PEOPLE_KEYS or k in _MCP_RECIPIENT_KEYS:
+                yield v
+            else:
+                yield from _reach_args(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _reach_args(v)
 
 
 # Tools that name who they reach by an id rather than an address.
@@ -1105,10 +1142,16 @@ def _team_file_name(tool_input: dict[str, Any]) -> str:
 
 def _writes_team_file(tool: str, tool_input: dict[str, Any]) -> bool:
     """Whether a connected-app step writes into a file (a sheet, doc,
-    slides, Drive file) and itself names no one outside the team: no mail,
-    no event, no address of anyone but a teammate. Who could already open
-    the file was settled when it was shared (sharing waits on its own)."""
-    return _file_tool(tool) and not _MAIL_TOOL_RE.search(tool) and _team_only(tool, tool_input)
+    slides, Drive file) and reaches no one outside the team: no mail, no
+    event, and no one but a teammate in its share or recipient arguments
+    (``_reach_addresses``); an address written into the file's text doesn't
+    count. Who approves a held step is ``_team_only``'s, which counts every
+    address. Who could already open the file was settled when it was shared
+    (sharing waits on its own)."""
+    return (
+        _file_tool(tool) and not _MAIL_TOOL_RE.search(tool)
+        and _all_team(_reach_addresses(tool, tool_input))
+    )
 
 
 def _mcp_deletes(tool: str, tool_input: dict[str, Any]) -> bool:
@@ -1136,10 +1179,15 @@ def check(
     text = "\n".join(_strings(tool_input))
     addresses, names = _targets(tool, tool_input)
     text = "\n".join([text, *names])
-    recipients = sorted({
+    # Your rules see every address the step names (wait wins); the level's
+    # checks only who it reaches (``_reach_addresses``).
+    named = sorted({
         a.lower() for a in [*_EMAIL_RE.findall(text), *addresses, *(extra_recipients or [])]
     })
-    hit = _rule_hit(rules, text, recipients)
+    recipients = sorted({
+        a.lower() for a in [*_reach_addresses(tool, tool_input), *(extra_recipients or [])]
+    })
+    hit = _rule_hit(rules, text, named)
     if hit is not None:
         return hit
     deletes = tool in _DELETE_TOOLS or (mcp and _mcp_deletes(tool, tool_input))
@@ -1708,6 +1756,7 @@ _FILE_WORD_RE = re.compile(
     r"|excel|workbooks?|worksheets?|onedrive|word)(?=$|[_-])", re.I,
 )
 _MAIL_TOOL_RE = re.compile(r"mail|message|calendar|event", re.I)
+_COMMENT_TOOL_RE = re.compile(r"comment|mention", re.I)
 
 
 def _file_tool(tool: str) -> bool:
