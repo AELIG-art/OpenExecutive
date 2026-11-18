@@ -38,7 +38,10 @@ UPDATE_REPLY_CARD_TOOL: dict[str, Any] = {
             },
             "body": {
                 "type": "string",
-                "description": "The whole reply in their voice, without a signature block. Omit to keep it.",
+                "description": (
+                    "The whole reply, written as your instructions say for who sends it now, without a "
+                    "signature block. With send_from, the card rewrites it once for the new sender. Omit to keep it."
+                ),
             },
             "artifact_ids": {
                 "type": "array",
@@ -253,24 +256,46 @@ async def handle_update_reply_card(tool_input: dict[str, Any]) -> str:
     # Who it goes from first, while the card still shows it being worked on:
     # a Send tapped before the switch would otherwise go as the person.
     sender = tool_input.get("send_from")
-    switched = sender in ("executive", "me")
-    if switched:
+    body = tool_input.get("body")
+    body = body if isinstance(body, str) else ""
+    note = str(tool_input.get("note") or "")
+    switched_from: str | None = None
+    if sender in ("executive", "me"):
         from openexecutive.delegation import send_from
 
         try:
-            await send_from.switch_for_work(card_id, writer.person, executive=sender == "executive", gmail=writer.mailbox)
+            # What the card's save would turn down, before the switch changes it.
+            card_work.checked(note, files)
+        except SendRefused as refused:
+            return _error(f"Nothing was changed: {refused.message}")
+
+        try:
+            # The body was written for who sent it before: the switch writes
+            # it once for the new sender, told what this run did. None when it
+            # already went from them: the body goes on as written.
+            switched_from = await send_from.switch_for_work(
+                card_id, writer.person, executive=sender == "executive", gmail=writer.mailbox, words=body, done=note,
+            )
         except SendRefused as refused:
             return _error(f"Nothing was changed: who it goes from couldn't be switched: {refused.message}")
-    body = tool_input.get("body")
+    switched = switched_from is not None
+    if not body.strip():
+        switched_from = None
+    elif switched:
+        # Already on the card: the run still wrote the reply.
+        body = ""
     try:
         await card_work.apply(
-            card_id, writer.person, body=body if isinstance(body, str) else "",
-            note=str(tool_input.get("note") or ""), files=files, gmail=writer.mailbox,
+            card_id, writer.person, body=body, switched_from=switched_from,
+            note=note, files=files, gmail=writer.mailbox,
             choices=card_work.clean_choices(tool_input.get("choices")),
         )
     except SendRefused as refused:
         if switched:
-            return _error(f"Who it goes from was changed, but nothing else was: {refused.message}")
+            return _error(
+                "Who it goes from was changed, and the reply was written again for them, but nothing else was: "
+                f"{refused.message}"
+            )
         return _error(f"Nothing was changed: {refused.message}")
     if artifact_ids:
         # Only the card's wording: it never stops the hand-back.

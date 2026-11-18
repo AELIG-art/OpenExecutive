@@ -280,9 +280,11 @@ def test_choosing_who_a_reply_goes_to(
 def test_choosing_who_a_reply_goes_from(
     client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from openexecutive.delegation import answers
+    from openexecutive.delegation import answers, send_from
 
     async def as_executive(model: str, system: str, turn: str) -> dict[str, Any]:
+        if system == send_from.AS_YOU_PROMPT:
+            return {"body": "Hi Dana,\n\nI'll get back to you soon."}
         return {"body": "Hi Dana,\n\nOlivia asked me to say she'll get back to you."}
 
     mailbox, card_id = _card(ids["principal"], monkeypatch)
@@ -300,9 +302,14 @@ def test_choosing_who_a_reply_goes_from(
     card = resp.json()
     assert card["from_executive"] is True and card["executive_name"]
     assert card["draft_body"].startswith("Hi Dana,\n\nOlivia asked me")
-    # Back to them: their words as they were.
+    # Back to them: the same words, written once more as them.
     back = client.put(url, json={"executive": False}, headers=OWNER).json()
-    assert back["from_executive"] is False and back["draft_body"] == before["draft_body"]
+    assert back["from_executive"] is False and back["draft_body"].startswith("Hi Dana,\n\nI'll get back to you soon.")
+    # A switch is no change to take back.
+    assert back["can_undo"] is False
+    undo = client.post(f"/delegation/replies/{card_id}/undo", headers=OWNER)
+    assert undo.status_code == 409 and undo.json()["detail"]["code"] == "nothing_to_undo"
+    assert client.post(f"/delegation/replies/{card_id}/undo", headers=TEAMMATE).status_code == 404
 
     # A rewrite that fails says so, and the card stays from them.
     async def broken(model: str, system: str, turn: str) -> dict[str, Any]:
@@ -437,3 +444,28 @@ def test_stop_ends_the_work_and_keeps_its_steps(
     # Someone else's card, or none: not found.
     assert client.post(url, headers=TEAMMATE).status_code in (403, 404)
     assert client.post("/delegation/replies/999999/stop", headers=OWNER).status_code == 404
+
+
+def test_undo_puts_back_the_words_from_before_a_change(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.delegation import card_drafts
+    from openexecutive.memory.decision_ledger import get_decision_instance, update_open_payload
+
+    mailbox, card_id = _card(ids["principal"], monkeypatch)
+    monkeypatch.setattr("openexecutive.delegation.gmail.gmail_for", lambda email: mailbox)
+    monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
+    card = get_decision_instance(card_id)
+    payload = inbox.card_payload(card)
+    first = payload["draft_body"]
+    # A change asked for on the card, as answers.change leaves it.
+    changed = {**payload, "draft_body": "Hi Dana,\n\nFriday works.\n\nOlivia",
+               card_drafts.UNDO_KEY: card_drafts.undo_point(payload)}
+    assert update_open_payload(card_id, changed, expected_json=card.proposed_payload_json)
+    assert client.get("/delegation/replies", headers=OWNER).json()["cards"][0]["can_undo"] is True
+    resp = client.post(f"/delegation/replies/{card_id}/undo", headers=OWNER)
+    assert resp.status_code == 200, resp.json()
+    back = resp.json()
+    assert back["draft_body"] == first and back["can_undo"] is False
+    assert back["conversation"][-1]["text"] == card_drafts.NOTE_UNDONE
+    assert mailbox.drafts[payload["draft_id"]].message.text == first

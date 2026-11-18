@@ -52,6 +52,12 @@ QUESTIONS_SETTLED = "questions_settled"
 # When a reply asked for in chat last replaced the card's (``from_chat``). A
 # card shown before then sends only once it was shown again (``version``).
 CHANGED_IN_CHAT = "changed_in_chat_at"
+# The card before the last change they asked for on it (an answer, their
+# words in its box, its work): its words and the questions answered then
+# (``undo_point``). ``undo`` puts them back. Any other change of the words,
+# a switch of who it goes from, or work that changed the files drops it.
+UNDO_KEY = "before_change"
+NOTE_UNDONE = "I put back the words from before that change."
 
 # Cards whose draft is being made right now in this process, so two taps
 # never make two.
@@ -325,7 +331,6 @@ async def edit(
     questions (``QUESTIONS_SETTLED``): the person wrote what goes. With
     ``everyone`` the words stay and who it goes to changes (``set_recipients``)."""
     from openexecutive.audit import rows_for_person
-    from openexecutive.delegation import send_from
     from openexecutive.delegation.inbox import card_payload
     from openexecutive.delegation.reply_send import SendRefused
 
@@ -344,14 +349,143 @@ async def edit(
             # Words changed by hand: the card's summary no longer says what
             # the draft says, so the card falls back to what they wrote.
             extra: dict[str, Any] = {} if recipients is not None else {QUESTIONS_SETTLED: True, "gist": ""}
+            if recipients is not None and can_undo(payload):
+                # Who it goes to only: the words' change can still be taken back.
+                extra[UNDO_KEY] = payload[UNDO_KEY]
             if rewrite is not None:
-                # Rewritten from the person's own words, in their voice, also
-                # on a card that goes from the Executive (``_edit`` writes it
-                # again as the Executive's there).
-                written, extra = await rewrite(person, send_from.theirs(payload))
+                # The card's own words, rewritten for whoever sends them.
+                written, extra = await rewrite(person, payload)
                 words = _check_words(written)
+                before = str(payload.get("draft_body") or "")
+                if words != before:
+                    # Their change can be taken back (``undo``). A question
+                    # answered after it can't: Undo shows under the last
+                    # note, so it only ever takes back what that note says.
+                    extra[UNDO_KEY] = undo_point(payload)
+            return await _edit(instance, person, payload, words, gmail, extra, recipients)
+        finally:
+            _EDITING.discard(instance.id)
+
+
+async def _remade(
+    instance: Any, person: Any, payload: dict[str, Any], changed: dict[str, Any], gmail: Any,
+    recipients: tuple[list[str], list[str]] | None,
+) -> dict[str, Any]:
+    """``changed`` saved, with the draft in their mailbox made again from it:
+    its words, who it goes to and the card's files, the old draft taken out.
+    Raises ``SendRefused``."""
+    from dataclasses import replace
+
+    from openexecutive.delegation import drafts
+    from openexecutive.delegation.card_work import files_for
+    from openexecutive.delegation.gmail import (
+        BLOCKING_CODES,
+        STATUS_MESSAGES,
+        GmailError,
+        gmail_for,
+        gmail_status,
+        normalize_email,
+    )
+    from openexecutive.delegation.inbox import CLOSED, _audit, _close_card
+    from openexecutive.delegation.reply_send import SendRefused
+    from openexecutive.memory.decision_ledger import update_open_payload
+
+    old = str(payload.get("draft_id") or "")
+    email = normalize_email(person.email)
+    client = gmail if gmail is not None else gmail_for(email)
+    status = await gmail_status(email, gmail=client)
+    if status != "connected":
+        raise SendRefused(409, BLOCKING_CODES.get(status, "gmail_error"), STATUS_MESSAGES[status])
+    # The same checks as a change to it (``_edit``): never over a draft they
+    # changed, sent or deleted in their mailbox meanwhile.
+    try:
+        there = await client.get_draft(old)
+    except GmailError as exc:
+        raise SendRefused(502, "gmail_error", "Couldn't save your change in your mailbox. Try again in a moment.") from exc
+    if there is None:
+        _close_card(person.id, instance.id, str(payload.get("message_id") or ""), "draft_gone", CLOSED)
+        raise SendRefused(409, "draft_gone", "That draft isn't in your mailbox any more: it was sent or deleted there.")
+    if there.message.id != str(payload.get(EDITED_VERSION) or payload.get("draft_message_id") or ""):
+        raise SendRefused(
+            409, "draft_changed",
+            "This draft was changed in your mailbox, so it wasn't changed here. Change it there, or dismiss it.",
+        )
+    spec = spec_for(changed, files_for(instance.id))
+    if recipients is not None:
+        spec = replace(spec, to=list(recipients[0]), cc=list(recipients[1]))
+    try:
+        created = await client.create_draft(spec)
+    except GmailError as exc:
+        raise SendRefused(502, "gmail_error", "Couldn't save your change in your mailbox. Try again in a moment.") from exc
+    changed["draft_id"], changed["draft_message_id"] = created.draft_id, created.message_id
+    changed.pop(EDITED_VERSION, None)
+    if not update_open_payload(instance.id, changed, expected_json=instance.proposed_payload_json):
+        await _delete_quietly(client, created.draft_id)
+        raise SendRefused(409, "already_handled", "This reply changed or was sent meanwhile. Look at it again.")
+    await _delete_quietly(client, old)
+    try:
+        drafts.rename(person.id, old, created.draft_id, created.message_id)
+    except Exception:
+        logger.warning("delegation.card_drafts: couldn't record the new draft", exc_info=True)
+    _audit("delegation_reply_edited", f"Person {person.id} changed a reply on its card", {
+        "person_id": person.id, "decision_id": instance.id, "in_mailbox": True,
+    })
+    return changed
+
+
+def undo_point(payload: dict[str, Any]) -> dict[str, Any]:
+    """What ``undo`` puts back: the card's words, the questions answered and
+    whether they were settled, as they are in ``payload`` before a change."""
+    from openexecutive.delegation.answers import ANSWERED_KEY
+
+    answered = payload.get(ANSWERED_KEY)
+    return {
+        "draft_body": str(payload.get("draft_body") or ""),
+        ANSWERED_KEY: dict(answered) if isinstance(answered, dict) else {},
+        QUESTIONS_SETTLED: payload.get(QUESTIONS_SETTLED) is True,
+    }
+
+
+def can_undo(payload: dict[str, Any]) -> bool:
+    point = payload.get(UNDO_KEY)
+    return isinstance(point, dict) and bool(str(point.get("draft_body") or "").strip())
+
+
+async def undo(instance: Any, *, caller: Any, resolver: int | None, gmail: Any = None) -> dict[str, Any]:
+    """Take back the last change they asked for on the card: its words and
+    the questions answered as they were before it (``UNDO_KEY``), saved like
+    any change, also in their mailbox's draft, with a line
+    in the card's conversation. The same checks as ``edit``. Returns the
+    card's payload as it now is; raises ``SendRefused``. Sends nothing."""
+    from openexecutive.audit import rows_for_person
+    from openexecutive.delegation.answers import (
+        ANSWERED_KEY,
+        CONVERSATION_KEY,
+        CONVERSATION_MAX,
+        conversation,
+    )
+    from openexecutive.delegation.inbox import card_payload
+    from openexecutive.delegation.reply_send import SendRefused
+
+    payload = card_payload(instance)
+    person = check(instance, caller=caller, resolver=resolver)
+    if not can_undo(payload):
+        raise SendRefused(409, "nothing_to_undo", "There's no change to take back. Look at it again.")
+    with rows_for_person(person.id):
+        if instance.id in _EDITING or instance.id in _MAKING:
+            raise SendRefused(409, "busy", "This reply is being saved or sent right now. Try again in a moment.")
+        _EDITING.add(instance.id)
+        try:
+            turns = [*conversation(payload), {
+                "kind": "note", "text": NOTE_UNDONE, "at": datetime.now(UTC).isoformat(),
+            }]
+            point = payload[UNDO_KEY]
+            extra = {
+                CONVERSATION_KEY: turns[-CONVERSATION_MAX:], "gist": "", ANSWERED_KEY: point[ANSWERED_KEY],
+                QUESTIONS_SETTLED: point[QUESTIONS_SETTLED],
+            }
             return await _edit(
-                instance, person, payload, words, gmail, extra, recipients, theirs=rewrite is not None,
+                instance, person, payload, _check_words(str(point["draft_body"])), gmail, extra, by_hand=False,
             )
         finally:
             _EDITING.discard(instance.id)
@@ -377,12 +511,8 @@ async def redraft(instance: Any, person: Any, gmail: Any, rewrite: Rewrite) -> d
         raise SendRefused(409, "busy", "This reply is being saved or sent right now.")
     _EDITING.add(instance.id)
     try:
-        from openexecutive.delegation import send_from
-
-        written, extra = await rewrite(person, send_from.theirs(payload))
-        return await _edit(
-            instance, person, payload, _check_words(written), gmail, extra, by_hand=False, theirs=True,
-        )
+        written, extra = await rewrite(person, payload)
+        return await _edit(instance, person, payload, _check_words(written), gmail, extra, by_hand=False)
     finally:
         _EDITING.discard(instance.id)
 
@@ -462,6 +592,8 @@ async def from_chat(
     on its own. Returns the payload as it now is; raises ``SendRefused``.
     Sends nothing."""
     from openexecutive.delegation import disclosure as ai_disclosure
+    from openexecutive.delegation import send_from
+    from openexecutive.delegation.answers import CONVERSATION_KEY, CONVERSATION_MAX, conversation
     from openexecutive.delegation.inbox import SENDING, card_payload
     from openexecutive.delegation.reply_send import SendRefused
     from openexecutive.delegation.settings import is_enabled
@@ -479,10 +611,17 @@ async def from_chat(
     _EDITING.add(instance.id)
     try:
         signed = ai_disclosure.sign(person.id, words, on_its_own=False)
-        extra = {QUESTIONS_SETTLED: True, "gist": "", CHANGED_IN_CHAT: datetime.now(UTC).isoformat()}
+        # What they asked for in chat goes as them: the card goes from them again.
+        now = datetime.now(UTC).isoformat()
+        extra: dict[str, Any] = {
+            QUESTIONS_SETTLED: True, "gist": "", CHANGED_IN_CHAT: now, send_from.FROM_EXECUTIVE: False,
+        }
+        if send_from.is_from_executive(payload):
+            # Said on the card, as a switch on the card is.
+            turns = [*conversation(payload), {"kind": "note", "text": send_from.NOTE_TO_YOU, "at": now}]
+            extra.update({CONVERSATION_KEY: turns[-CONVERSATION_MAX:], send_from.SWITCHED_BACK_AT: now})
         return await _edit(
-            instance, person, payload, _check_words(signed), gmail, extra, (list(to), list(cc)),
-            by_hand=False, theirs=True,
+            instance, person, payload, _check_words(signed), gmail, extra, (list(to), list(cc)), by_hand=False,
         )
     finally:
         _EDITING.discard(instance.id)
@@ -490,16 +629,16 @@ async def from_chat(
 
 async def _edit(
     instance: Any, person: Any, payload: dict[str, Any], words: str, gmail: Any, extra: dict[str, Any],
-    recipients: tuple[list[str], list[str]] | None = None, *, by_hand: bool = True, theirs: bool = False,
+    recipients: tuple[list[str], list[str]] | None = None, *, by_hand: bool = True,
 ) -> dict[str, Any]:
     """``edit`` once its checks passed, one at a time per card. Not
     ``by_hand`` (``redraft``): the words stay the Executive's, so Send and
-    training don't take them for the person's change. ``theirs``: ``words``
-    are in the person's voice (a rewrite, a reply from chat), not the card's
-    own words changed by hand; on a card that goes from the Executive they
-    are kept as theirs and the card's are written again as the Executive's
-    (``send_from.restyled``). A draft in their mailbox always holds their
-    own words."""
+    training don't take them for the person's change. ``words`` are the
+    card's one version, for whoever sends it (``send_from``). A draft in
+    their mailbox is brought up to date only while it goes from them: from
+    the Executive it never goes from there. ``UNDO_KEY`` is kept only when
+    ``extra`` sets it (a change they asked for): any other change of the
+    words can't be taken back to before it."""
     from openexecutive.delegation import send_from
     from openexecutive.delegation.gmail import (
         BLOCKING_CODES,
@@ -516,19 +655,20 @@ async def _edit(
     from openexecutive.memory.decision_ledger import update_open_payload
 
     changed = {**payload, **extra, "draft_body": words, **({EDITED_ON_CARD: True} if by_hand else {})}
+    if UNDO_KEY not in extra:
+        changed.pop(UNDO_KEY, None)
     if recipients is not None:
         to, cc = recipients
         changed["draft_to"] = [*to, *cc]
         spec = payload.get(DRAFT_SPEC)
         if isinstance(spec, dict):
             changed[DRAFT_SPEC] = {**spec, "to": to, "cc": cc}
-    if theirs:
-        changed = await send_from.restyled(person, changed, words)
-    elif send_from.is_from_executive(changed) and words != str(payload.get("draft_body") or ""):
-        changed[send_from.CHANGED_AS_EXECUTIVE] = True
-    # What their mailbox's draft says: their own words, never the Executive's.
-    words = str(send_from.theirs(changed).get("draft_body") or "")
-    draft_id = str(payload.get("draft_id") or "")
+    # Their mailbox's draft goes from them: it never holds the Executive's words.
+    draft_id = "" if send_from.is_from_executive(changed) else str(payload.get("draft_id") or "")
+    if draft_id and send_from.is_from_executive(payload):
+        # From them again: the draft waited unchanged while it went from the
+        # Executive, so it is made again from the card, words and files.
+        return await _remade(instance, person, payload, changed, gmail, recipients)
     if draft_id:
         email = normalize_email(person.email)
         client = gmail if gmail is not None else gmail_for(email)

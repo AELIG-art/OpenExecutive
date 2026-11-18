@@ -478,6 +478,7 @@ def prompt_for(person: Any, payload: dict[str, Any], card_id: int, *, ask: str =
     """The turn's message: which email, where to read it, what to do and how
     to hand the result back. Only ids and headers from the card: the email's
     own words are read with the mail tools, which treat them as data."""
+    from openexecutive.delegation import send_from
     from openexecutive.delegation.ghostwriter import one_line
     from openexecutive.utils.prompt_blocks import no_tags
 
@@ -510,8 +511,14 @@ def prompt_for(person: Any, payload: dict[str, Any], card_id: int, *, ask: str =
         "becomes a card for them, which is fine.",
         "",
         "Then call update_reply_card once:",
-        f"- body: the whole reply in {first}'s voice, delivering what you did (say what is "
-        "attached and give the key figures). No signature block.",
+        (
+            f"- body: the whole reply, which goes from you, from your own mailbox with {first} on cc: "
+            f"{send_from.writer_note(payload)} Deliver what you did (say what is attached and give "
+            "the key figures). No signature block and no sign-off name."
+            if send_from.is_from_executive(payload) else
+            f"- body: the whole reply in {first}'s voice, delivering what you did (say what is "
+            "attached and give the key figures). No signature block."
+        ),
         "- artifact_ids and files: what the reply should carry (what draft_artifact made on "
         "this turn, and files from this email's own threads).",
         f"- note: one short sentence to {first} saying what you did.",
@@ -648,24 +655,38 @@ def _close(card_id: int) -> None:
         person, gmail, ask = queued
         start(person, card_id, gmail=gmail, ask=ask)
 
+def checked(note: str, files: list[tuple[str, str, bytes]]) -> str:
+    """What ``apply`` turns down before it changes anything: too many or
+    too big files, no note. Returns the note as one line; raises
+    ``SendRefused``. The work turn checks it before a switch of who it goes
+    from too, so a refusal always means nothing was changed."""
+    from openexecutive.delegation.ghostwriter import one_line
+    from openexecutive.delegation.reply_send import SendRefused
+
+    if len(files) > MAX_FILES or sum(len(d) for _, _, d in files) > MAX_BYTES:
+        raise SendRefused(422, "too_big", f"At most {MAX_FILES} files and {MAX_BYTES // 2**20} MB in all.")
+    text = one_line(note, MAX_NOTE_CHARS)
+    if not text:
+        raise SendRefused(422, "no_note", "Say in one line what you did, in note.")
+    return text
+
+
 async def apply(
     card_id: int, person: Any, *, body: str, note: str, files: list[tuple[str, str, bytes]],
-    gmail: Any = None, choices: list[str] | None = None,
+    gmail: Any = None, choices: list[str] | None = None, switched_from: str | None = None,
 ) -> dict[str, Any]:
     """Put what the turn did on card ``card_id``: the reply's new words
     (``body``; "" keeps them), the files it carries and the line to the
-    person (``note``). Returns the payload as it now is; raises ``SendRefused``.
+    person (``note``). ``switched_from``: the turn's words were already put
+    on the card by its switch of who it goes from (``send_from.switch_for_work``),
+    and these were the card's words before it: the run wrote the reply all
+    the same. Returns the payload as it now is; raises ``SendRefused``.
     Sends nothing itself (``_after`` may, when Approvals lets the reply go)."""
-    from openexecutive.delegation import card_drafts
-    from openexecutive.delegation import disclosure as ai_disclosure
-    from openexecutive.delegation.ghostwriter import (
-        _drop_name_before_signature,
-        clean_gist,
-        one_line,
-    )
+    from openexecutive.delegation import card_drafts, send_from
+    from openexecutive.delegation.answers import changed_sentences
+    from openexecutive.delegation.ghostwriter import clean_gist
     from openexecutive.delegation.inbox import SENDING, card_payload
     from openexecutive.delegation.reply_send import SendRefused
-    from openexecutive.delegation.voice import get_voice
     from openexecutive.memory.decision_ledger import (
         STATUS_PROPOSED,
         get_decision_instance,
@@ -679,32 +700,40 @@ async def apply(
         raise SendRefused(403, "not_yours", "That card isn't this person's.")
     if card_id in card_drafts._EDITING or card_id in card_drafts._MAKING:
         raise SendRefused(409, "busy", "The reply is being changed or sent right now. Try again in a moment.")
-    if len(files) > MAX_FILES or sum(len(d) for _, _, d in files) > MAX_BYTES:
-        raise SendRefused(422, "too_big", f"At most {MAX_FILES} files and {MAX_BYTES // 2**20} MB in all.")
-    text = one_line(note, MAX_NOTE_CHARS)
-    if not text:
-        raise SendRefused(422, "no_note", "Say in one line what you did, in note.")
+    text = checked(note, files)
     picks = clean_choices(choices)
     changed: dict[str, Any] = {
         **_end_turn(payload, state=STUCK if picks else DONE, text=text, choices=picks),
-        WORK_KEY: DONE, REWROTE_KEY: bool((body or "").strip()),
+        WORK_KEY: DONE, REWROTE_KEY: bool((body or "").strip()) or switched_from is not None,
     }
+    # Only what this run changed can be taken back (Undo shows under its
+    # note), never a change from before it.
+    changed.pop(card_drafts.UNDO_KEY, None)
     words = (body or "").replace("\r", "").strip()
+    was = str(payload.get("draft_body") or "")
+    if switched_from is not None:
+        # Written and signed for the new sender by the switch already.
+        words, was = was, switched_from
+    elif words:
+        # Written for whoever sends it (prompt_for), signed for them.
+        words = send_from.sign(
+            person, payload, words, on_its_own=getattr(card, "gate_mode", "") == "auto_execute",
+        )
     if words:
-        signature = get_voice(person.id).profile.signature.strip()
-        if signature and signature not in words:
-            words = f"{_drop_name_before_signature(words, signature)}\n\n{signature}"
-        words = ai_disclosure.sign(person.id, words, on_its_own=getattr(card, "gate_mode", "") == "auto_execute")
         if len(words) > card_drafts.MAX_TEXT_CHARS:
             raise SendRefused(422, "too_long", "That reply is too long.")
         changed["draft_body"] = words
         changed["gist"] = clean_gist(text)
         changed[card_drafts.QUESTIONS_SETTLED] = True
-        # Written in the person's voice: on a card that goes from the
-        # Executive, kept as theirs and written again as the Executive's.
-        from openexecutive.delegation import send_from
-
-        changed = await send_from.restyled(person, changed, words)
+        if words != was:
+            # The work's change can be taken back (``card_drafts.undo``) when
+            # the reply carries no files (its words alone put back), and its
+            # note quotes what it made new.
+            if not files and not files_for(card_id) and switched_from is None:
+                changed[card_drafts.UNDO_KEY] = card_drafts.undo_point(payload)
+            new = changed_sentences(send_from.split(person, payload, was)[0], send_from.split(person, payload, words)[0])
+            if new:
+                changed["conversation"][-1]["changed"] = new
     # None given keeps what the reply already carries (card, draft and Send agree).
     new_files = bool(files)
     if not new_files:
@@ -720,7 +749,9 @@ async def apply(
     if handing:
         _HANDED.add(card_id)
     try:
-        await _save(card, payload, changed, person, files, gmail, rewrote=bool(words) or new_files)
+        # A switch already brought their mailbox's draft up to date with the words.
+        rewrote = (bool(words) and switched_from is None) or new_files
+        await _save(card, payload, changed, person, files, gmail, rewrote=rewrote)
     except BaseException:
         _store(card_id, before)
         if handing:
@@ -750,14 +781,15 @@ async def _save(
 
     gone = SendRefused(409, "already_handled", "This reply changed or was sent meanwhile.")
     old_draft = str(payload.get("draft_id") or "")
-    if not (old_draft and rewrote):
+    if not (old_draft and rewrote) or send_from.is_from_executive(changed):
+        # Their mailbox's draft goes from them: never the Executive's words.
         if not update_open_payload(card.id, changed, expected_json=card.proposed_payload_json):
             raise gone
         return
     client = gmail if gmail is not None else gmail_for(normalize_email(person.email))
     try:
         # Their mailbox holds their own words, never the Executive's.
-        created = await client.create_draft(card_drafts.spec_for(send_from.theirs(changed), files))
+        created = await client.create_draft(card_drafts.spec_for(changed, files))
     except GmailError as exc:
         raise SendRefused(502, "gmail_error", "Couldn't save the reply in their mailbox.") from exc
     changed["draft_id"], changed["draft_message_id"] = created.draft_id, created.message_id
