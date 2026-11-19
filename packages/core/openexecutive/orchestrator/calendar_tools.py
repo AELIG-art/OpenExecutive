@@ -19,8 +19,11 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import UTC, date, datetime, timedelta, tzinfo
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+
+from openexecutive.memory import workspace_settings
+from openexecutive.memory.workspace_settings import COMPANY_TIME_HINT
 
 if TYPE_CHECKING:
     from openexecutive.departments.authority import GateDecision
@@ -84,11 +87,11 @@ CREATE_CALENDAR_EVENT_TOOL: dict[str, Any] = {
             },
             "start": {
                 "type": "string",
-                "description": "Start time in ISO 8601 format with timezone (e.g. 2025-06-15T14:00:00+00:00)",
+                "description": "Start time. " + COMPANY_TIME_HINT,
             },
             "end": {
                 "type": "string",
-                "description": "End time in ISO 8601 format with timezone. Must be after start.",
+                "description": "End time, after the start. " + COMPANY_TIME_HINT,
             },
             "attendee_person_ids": {
                 "type": "array",
@@ -281,27 +284,11 @@ def typed_booking_only(offered: bool, call_tool: Any) -> Any:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _local_tz() -> tzinfo:
-    """The company's time zone (Settings), UTC when it can't be read."""
-    try:
-        from openexecutive.memory.workspace_settings import get_user_timezone
-
-        return get_user_timezone()
-    except Exception:
-        return UTC
-
-
 def _parse_iso(raw: str) -> datetime | None:
-    """Parse an ISO 8601 string; return None on failure. A time with no
-    offset ("2026-11-05T14:00") is the company's local time, as the person
-    said it, never UTC."""
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=_local_tz())
-        return dt.astimezone(UTC)
-    except (ValueError, AttributeError):
-        return None
+    """A time from the Executive in UTC (``company_time``: no offset is the
+    company's time), or None."""
+    dt = workspace_settings.company_time(raw)
+    return dt.astimezone(UTC) if dt is not None else None
 
 
 def is_business_day(day: date) -> bool:
@@ -319,7 +306,7 @@ def _check_business_hours(dt: datetime, start_hhmm: str, end_hhmm: str) -> bool:
     except (ValueError, AttributeError):
         return True  # misconfigured cap → don't block
     if dt.tzinfo is not None:
-        dt = dt.astimezone(_local_tz())
+        dt = dt.astimezone(workspace_settings.get_user_timezone())
     if not is_business_day(dt.date()):
         return False
     t_minutes = dt.hour * 60 + dt.minute
@@ -731,9 +718,9 @@ async def handle_create_calendar_event(tool_input: dict[str, Any]) -> str:
     start = _parse_iso(start_raw)
     end = _parse_iso(end_raw)
     if start is None:
-        return json.dumps({"error": f"start is not valid ISO 8601: {start_raw!r}"})
+        return json.dumps({"error": f"start {start_raw!r} can't be read. {COMPANY_TIME_HINT}"})
     if end is None:
-        return json.dumps({"error": f"end is not valid ISO 8601: {end_raw!r}"})
+        return json.dumps({"error": f"end {end_raw!r} can't be read. {COMPANY_TIME_HINT}"})
     if start <= now:
         return json.dumps({"error": "start must be in the future"})
     if end <= start:

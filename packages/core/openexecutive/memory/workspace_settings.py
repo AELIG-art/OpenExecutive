@@ -421,6 +421,31 @@ def get_user_timezone(db_path: Path | None = None) -> ZoneInfo:
     return zone if zone is not None else _configured_timezone()
 
 
+# How a tool asks the Executive for a time: in the company's zone, as the
+# person said it, read back by ``company_time``.
+COMPANY_TIME_HINT = (
+    "When, in the company's time zone, as the person said it: "
+    "2026-11-20T12:00 for noon. Never converted to UTC."
+)
+
+
+def company_time(raw: object) -> datetime | None:
+    """A date and time someone gave (the Executive in a tool call, a person
+    in a form), as an aware datetime, or None when it isn't one.
+
+    The one reader for such times. A time with no offset
+    ("2026-11-20T12:00") is the company's time, as the person said it, never
+    UTC; a "Z" or an offset is kept. Never raises.
+    """
+    try:
+        parsed = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=get_user_timezone())
+    return parsed
+
+
 def _valid_mode(value: object) -> WorkspaceMode | None:
     if value == "solo":
         return "solo"
@@ -563,6 +588,23 @@ def set_timezone(tz: str | None) -> WorkspaceSettings:
             except Exception:
                 logger.exception("workspace: re-timing %s failed", retime.__module__)
     return get_workspace()
+
+
+def set_timezone_if_unset(tz: str | None) -> bool:
+    """Store ``tz`` as the company's zone only while no zone is in effect:
+    none stored and no ``USER_TIMEZONE``. Returns whether it was stored.
+
+    For a device's zone (setup), which never moves a clock someone set.
+    Reads the stored row directly, so a read that fails raises rather than
+    reading as "none stored" and replacing a zone that is there.
+    """
+    row = _read_row(None)
+    if row is not None and row["timezone"] is not None:
+        return False
+    if _configured_timezone().key != "UTC":
+        return False
+    set_timezone(tz)
+    return True
 
 
 def set_workspace_mode(mode: str) -> WorkspaceSettings:

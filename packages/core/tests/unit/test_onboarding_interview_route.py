@@ -1694,3 +1694,88 @@ def test_the_website_is_saved_with_the_session(
     route._interview_sessions.clear()
     stored = interview_store.load(sid)
     assert stored is not None and stored.website == "https://example.com/"
+
+
+def _zone_calls(monkeypatch: pytest.MonkeyPatch, stored: str | None) -> list[str | None]:
+    from openexecutive.memory import workspace_settings as ws
+
+    saved: list[str | None] = []
+    monkeypatch.setattr(ws, "_read_row", lambda *a, **k: {"timezone": stored} if stored else None)
+    monkeypatch.setattr(ws, "set_timezone", lambda tz: saved.append(tz))
+    monkeypatch.setattr("openexecutive.audit.log_event", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "openexecutive.api.routes.chat._caller_is_principal_or_unclaimed", lambda request: True
+    )
+    return saved
+
+
+def test_commit_saves_the_devices_zone_as_the_companys(
+    client: TestClient, seeded: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Setup is where a company gets its clock: the device's zone goes with
+    the commit, so nothing the Executive schedules on the first day lands
+    in UTC."""
+    saved = _zone_calls(monkeypatch, None)
+    seeded.append(_draft())
+    sid = _start(client)
+    body = {**_commit_body(sid), "timezone": "America/New_York"}
+    assert client.post("/onboard/interview/commit", json=body).status_code == 200
+    assert saved == ["America/New_York"]
+
+
+def test_a_later_setup_never_moves_a_clock_already_set(
+    client: TestClient, seeded: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = _zone_calls(monkeypatch, "Europe/Berlin")
+    seeded.append(_draft())
+    sid = _start(client)
+    body = {**_commit_body(sid), "timezone": "America/New_York"}
+    assert client.post("/onboard/interview/commit", json=body).status_code == 200
+    assert saved == []
+
+
+def test_commit_with_an_unknown_zone_still_saves_and_leaves_the_zone(
+    client: TestClient, seeded: list[Any], monkeypatch: pytest.MonkeyPatch, profile_path: Path
+) -> None:
+    saved = _zone_calls(monkeypatch, None)
+    seeded.append(_draft())
+    sid = _start(client)
+    body = {**_commit_body(sid), "timezone": "Mars/Olympus"}
+    assert client.post("/onboard/interview/commit", json=body).status_code == 200
+    assert profile_path.exists() and saved == []
+
+
+def test_a_teammates_setup_leaves_the_companys_clock_alone(
+    client: TestClient, seeded: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The zone is a company-wide setting: setup saves it only for someone
+    Settings lets change it. The rest of the setup still saves."""
+    saved = _zone_calls(monkeypatch, None)
+    monkeypatch.setattr(
+        "openexecutive.api.routes.chat._caller_is_principal_or_unclaimed", lambda request: False
+    )
+    monkeypatch.setattr(
+        "openexecutive.api.routes.people.caller_is_admin_teammate", lambda request: False, raising=False
+    )
+    seeded.append(_draft())
+    sid = _start(client)
+    body = {**_commit_body(sid), "timezone": "Asia/Tokyo"}
+    assert client.post("/onboard/interview/commit", json=body).status_code == 200
+    assert saved == []
+
+
+def test_setup_keeps_a_clock_the_server_was_configured_with(
+    client: TestClient, seeded: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """USER_TIMEZONE is a clock someone set too: setup leaves it in effect."""
+    from zoneinfo import ZoneInfo
+
+    from openexecutive.memory import workspace_settings as ws
+
+    saved = _zone_calls(monkeypatch, None)
+    monkeypatch.setattr(ws, "_configured_timezone", lambda: ZoneInfo("Europe/London"))
+    seeded.append(_draft())
+    sid = _start(client)
+    body = {**_commit_body(sid), "timezone": "America/Los_Angeles"}
+    assert client.post("/onboard/interview/commit", json=body).status_code == 200
+    assert saved == []
