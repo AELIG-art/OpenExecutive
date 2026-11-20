@@ -41,6 +41,12 @@ _STARTS = ("start", "start_time")
 _ENDS = ("end", "end_time")
 # Who a meeting is with, by their People entry.
 _PEOPLE_IDS = frozenset({"attendee_person_ids", "person_ids", "participant_person_ids"})
+# One person, by their People entry: the field's label says who they are
+# to the step. Any other ``*person_id`` reads "Who".
+_PERSON_LABELS: dict[str, str] = {
+    "owner_person_id": "Owner", "assigned_to_person_id": "Assigned to", "for_person_id": "For",
+    "reports_to_person_id": "Reports to",
+}
 _REFS = frozenset({"thread_id", "message_id", "in_reply_to", "references", "draft_id"})
 # Shown only when not the default: an event on another calendar, a file in
 # a shared drive.
@@ -374,6 +380,8 @@ def plain(tool: str, tool_input: Any) -> list[dict[str, Any]]:
     if not isinstance(tool_input, dict):
         return []
     google = isinstance(tool, str) and tool.startswith("google_workspace__")
+    # One of our own tools, not a connected app's ("server__tool").
+    own = isinstance(tool, str) and "__" not in tool
     out: list[dict[str, Any]] = []
     refs: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -398,6 +406,19 @@ def plain(tool: str, tool_input: Any) -> list[dict[str, Any]]:
             if names is not None:
                 out.append({"field": "With", "value": names})
                 seen.add("With")
+                continue
+        if own:
+            # Our own tools name people, departments and goals by their
+            # number: the card shows the name, and never a bare number.
+            named = _own_ref(tool, norm, value)
+            if named is not None:
+                if named:
+                    field = named[0] if named[0] not in seen else f"{named[0]} ({key.replace('_', ' ')})"
+                    out.append({"field": field, "value": named[1]})
+                    seen.add(field)
+                elif value not in (None, "", 0, [], {}):
+                    # Shown only when the call names nothing else.
+                    refs.append({"field": label(key), "value": _text(value)})
                 continue
         if norm in _REFS and value not in (None, "", [], {}):
             refs.append({"field": label(key), "value": _text(value)})
@@ -449,6 +470,81 @@ def plain(tool: str, tool_input: Any) -> list[dict[str, Any]]:
     # A call that names only what it acts on (send this draft, delete this
     # message) still shows that, never an empty card.
     return out or refs
+
+
+def _own_ref(tool: str, norm: str, value: Any) -> tuple[str, str] | tuple[()] | None:
+    """For one of our own tools' reference fields, the (label, name) the
+    card shows: a person, a department or a goal by name. ``()`` when the
+    field is a record's number only the system reads (a task's, a card's): it
+    shows only on a card that names nothing else. None for any other field."""
+    from openexecutive.orchestrator import take_the_lead
+
+    target = take_the_lead._TARGET_KEYS.get(tool)
+    if target is not None and target[1] != "person" and norm == target[0]:
+        # A chat app's own id for who it goes to: their name when they're
+        # on People, else the id, the only way to tell who it reaches.
+        if value in (None, ""):
+            return ()
+        person = take_the_lead._target_person(tool, {target[0]: value})
+        return ("To", (person.full_name or person.email or str(value)) if person is not None else str(value))
+    if norm.endswith("person_ids"):
+        ids = value if isinstance(value, list) else [value]
+        if not [i for i in ids if i not in (None, "")]:
+            return ()
+        # Each by name; one People doesn't have still counts, so the card
+        # shows everyone Approve reaches.
+        each = [_names(i) or ("someone not on People" if _record_number(i) else _text(i)) for i in ids]
+        return ("With", ", ".join(each))
+    if norm.endswith("person_id"):
+        if value in (None, "", 0):
+            return ()
+        label = "To" if tool == "message_person" and norm == "person_id" else _PERSON_LABELS.get(norm, "Who")
+        if tool == "assign_open_loop" and norm == "person_id":
+            label = "Assigned to"
+        names = _names(value)
+        if names:
+            return (label, names)
+        # A number People doesn't have; anything else is shown as it is.
+        return (label, "Someone not on People" if _record_number(value) else _text(value))
+    if norm == "department_slug":
+        return ("Department", _department(value)) if value else ()
+    if norm in ("goal_id", "for_goal_id"):
+        goal = _goal(value)
+        return ("Goal", goal) if goal else ()
+    if (norm.endswith("_id") or norm.endswith("_ids")) and _record_number(value):
+        return ()
+    return None
+
+
+def _record_number(value: Any) -> bool:
+    """Whether a value is one of our own records' numbers (a task's, a
+    card's): never a yes/no or an account a step sets, which show."""
+    values = value if isinstance(value, list) else [value]
+    return bool(values) and all(isinstance(v, int) and not isinstance(v, bool) for v in values)
+
+
+def _department(slug: Any) -> str:
+    """A department's name, or its slug in words when it isn't found."""
+    try:
+        from openexecutive.departments.store import get_department
+
+        dept = get_department(str(slug))
+        if dept is not None and dept.config.title:
+            return dept.config.title
+    except Exception:
+        pass
+    return str(slug).replace("_", " ").replace("-", " ").strip().capitalize()
+
+
+def _goal(goal_id: Any) -> str:
+    """A goal's key result, or "" when there's none by that number."""
+    try:
+        from openexecutive.departments.store import get_goal
+
+        goal = get_goal(int(goal_id)) if int(goal_id) else None
+    except Exception:
+        return ""
+    return goal.key_result if goal is not None else ""
 
 
 def held_steps(payload: dict[str, Any]) -> list[dict[str, Any]]:

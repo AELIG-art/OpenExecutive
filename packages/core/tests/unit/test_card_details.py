@@ -369,3 +369,83 @@ def test_a_held_cards_top_says_who_it_waits_on_who_started_it_and_why_it_waits(m
         "started"] == "Someone asked"
     training = card_details.top({"kind": "training", "reason": "x"}, approver_id=1, viewer_id=1)
     assert training["waits"] == "It's a new kind of step for me, so it waits for an OK once."
+
+
+def test_our_own_tools_name_people_departments_and_goals_never_a_number(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from openexecutive.departments import store as dept_store
+    from openexecutive.people import registry
+
+    people = {4: "Annamarie Braden", 7: "Leo Park"}
+    monkeypatch.setattr(
+        registry, "get_person",
+        lambda pid, include_contacts=False: SimpleNamespace(full_name=people[pid], email="") if pid in people else None,
+    )
+    monkeypatch.setattr(
+        dept_store, "get_department",
+        lambda slug: SimpleNamespace(config=SimpleNamespace(title="Sales")) if slug == "sales" else None,
+    )
+    monkeypatch.setattr(dept_store, "get_goal", lambda gid: SimpleNamespace(key_result="Close 10 deals") if gid == 3 else None)
+
+    shown = card_details.plain("message_person", {"person_id": 4, "text": "Hi"})
+    assert shown == [{"field": "To", "value": "Annamarie Braden"}, {"field": "Message", "value": "Hi"}]
+
+    shown = card_details.plain("assign_open_loop", {
+        "assigned_to_person_id": 7, "loop_id": 12, "department_slug": "sales", "goal_id": 3, "task": "Call Acme",
+    })
+    assert shown == [
+        {"field": "Assigned to", "value": "Leo Park"}, {"field": "Department", "value": "Sales"},
+        {"field": "Goal", "value": "Close 10 deals"}, {"field": "Task", "value": "Call Acme"},
+    ]
+    # A number that names no one, or only the system reads, isn't shown.
+    assert card_details.plain("message_person", {"person_id": 99, "loop_id": 12, "text": "Hi"}) == [
+        {"field": "To", "value": "Someone not on People"}, {"field": "Message", "value": "Hi"},
+    ]
+    # Two people with the same kind of label are told apart.
+    assert [d["field"] for d in card_details.plain("x", {"target_person_id": 4, "cadence_person_id": 7})] == [
+        "Who", "Who (cadence person id)",
+    ]
+    assert card_details.plain("x", {"alert_id": 5, "status": "done"}) == [{"field": "Status", "value": "done"}]
+    # A call that names only a number still says what it acts on.
+    assert card_details.plain("cancel_followup", {"action_id": 5}) == [{"field": "Action id", "value": "5"}]
+
+
+def test_a_connected_apps_ids_are_still_shown() -> None:
+    # A connected app's step may act only on its own record: that stays.
+    assert card_details.plain("asana__update_task", {"task_id": "123"}) == [{"field": "Task id", "value": "123"}]
+
+
+def test_a_chat_app_message_names_who_it_goes_to(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from openexecutive.people import store
+
+    monkeypatch.setattr(
+        store, "find_person_by_slack_id",
+        lambda sid, include_contacts=False: SimpleNamespace(full_name="Ria Lopez", email="") if sid == "U_RIA" else None,
+    )
+    monkeypatch.setattr(store, "find_person_by_telegram_chat_id", lambda cid, include_contacts=False: None)
+    assert card_details.plain("send_slack_dm", {"user_id": "U_RIA", "text": "Hi"})[0] == {"field": "To", "value": "Ria Lopez"}
+    # Not on People: the chat's id is all there is to say who it reaches.
+    assert card_details.plain("send_telegram_message", {"chat_id": "-100123", "text": "Hi"})[0] == {
+        "field": "To", "value": "-100123",
+    }
+
+
+def test_an_account_or_a_yes_no_a_step_sets_is_still_shown(monkeypatch) -> None:
+    monkeypatch.setattr(card_details, "_names", lambda value: "Dana Lee")
+    shown = card_details.plain("upsert_person", {"person_id": 4, "full_name": "Dana", "slack_user_id": "U_OTHER"})
+    assert {"field": "Slack user id", "value": "U_OTHER"} in shown
+    shown = card_details.plain("resolve_roster_request", {"decision": "link", "person_id": 4, "replace_channel_id": True})
+    assert {"field": "Replace channel id", "value": "Yes"} in shown
+
+
+def test_a_person_given_by_something_other_than_a_number_shows_as_given() -> None:
+    assert card_details.plain("message_person", {"person_id": "dana@x.com"})[0] == {"field": "To", "value": "dana@x.com"}
+
+
+def test_a_list_of_people_with_one_not_on_people_still_shows_everyone(monkeypatch) -> None:
+    monkeypatch.setattr(card_details, "_names", lambda value: "Annamarie Braden" if value == 4 else None)
+    shown = card_details.plain("create_calendar_event", {"title": "Sync", "attendee_person_ids": [4, 99]})
+    assert {"field": "With", "value": "Annamarie Braden, someone not on People"} in shown
