@@ -12,6 +12,7 @@ from openexecutive.alerts import dispatcher, preferences, store
 from openexecutive.alerts.models import (
     PERSONAL_SOURCES,
     PRIVATE_ALERT_TAG,
+    TEAM_RAISED_SOURCE,
     AlertChannel,
     AlertEvent,
     AlertSeverity,
@@ -332,13 +333,18 @@ async def evaluate_and_dispatch(
     # A producer that knows the stable identity of the situation (a watch
     # slug) wins over the model's free-text key.
     dedup_key = event.dedup_hint or decision.dedup_key
-    if event.raised_by:
-        # One team member's alert never folds into another's card.
-        dedup_key = f"raised_by:{(event.from_ or event.raised_by).lower()}:{dedup_key}"
     topic_tags = _with_department_tag(
         decision.topic_tags, event.department or event.channel,
     )
     routed_to = _person_id_from_event(event)
+    if event.raised_by:
+        # One team member's alert never folds into another's card, nor into
+        # one of theirs for someone else: it shows only to them and whom it
+        # is for (``models._team_card_reader``).
+        for_whom = routed_to if routed_to is not None else ",".join(
+            sorted(t for t in topic_tags if t.startswith("department:"))
+        )
+        dedup_key = f"raised_by:{(event.from_ or event.raised_by).lower()}:{for_whom}:{dedup_key}"
     if event.private:
         topic_tags, routed_to, dedup_key, effective_channels = _make_private(
             topic_tags, dedup_key
@@ -459,6 +465,9 @@ def _insert(
         topic_tags=[t for t in topic_tags if not t.startswith("collection:")],
         dedup_key=dedup_key,
         routed_to_person_id=routed_to,
+        # A card a team member raised is theirs and its reader's
+        # (``models.visible_alert``): who raised it is kept beside whom it is for.
+        owner_person_id=event.raised_by_person_id if event.source == TEAM_RAISED_SOURCE else None,
         needs=event.needs,
         question=event.question,
         choices=event.choices,

@@ -25,8 +25,9 @@ How two cards on one topic become one:
 * Two Approve cards stay two (each is its own yes), except a newer mail send
   to the same people on the same thread, which replaces the one waiting:
   the older decision closes and its card goes.
-* Two other cards: the newer joins the older, and a question it asks
-  becomes the card's question when the older one asked none.
+* Two other cards: the newer joins the older. A newer one that asks
+  something is the matter as it stands now: its title, plan and question
+  lead, the older text above its own ("Then: ...").
 * The card that stays takes the graver severity of the two, and a card that
   joined is never sent on its own (``dispatcher.dispatch_all``).
 
@@ -327,20 +328,46 @@ def _decision_of(tags: list[str]) -> int | None:
     return None
 
 
-def _reader(routed_to: Any, tags: list[str]) -> str:
-    """Who reads the card: one person, or the team; and whether it is the
-    principal's alone. Cards for different readers never join."""
+def _reader(routed_to: Any, tags: list[str], *, raised_by: Any = None, team_raised: bool = False) -> str:
+    """Who reads the card: one person, or the team; whether it is the
+    principal's alone; and, for a card a team member raised, who raised it,
+    as they read it too (``models.visible_alert``), so it joins only another
+    of theirs: never a card the rest of the team sees, nor one another
+    teammate raised. Unrouted, its departments are whom it is for
+    (``models._team_card_reader``), so they are part of the key too. Cards
+    for different readers never join."""
     from openexecutive.alerts.models import PRIVATE_ALERT_TAG
 
-    who = str(routed_to) if isinstance(routed_to, int) and not isinstance(routed_to, bool) else "team"
-    return f"{who}{':private' if PRIVATE_ALERT_TAG in tags else ''}"
+    routed = isinstance(routed_to, int) and not isinstance(routed_to, bool)
+    reader = f"{routed_to if routed else 'team'}{':private' if PRIVATE_ALERT_TAG in tags else ''}"
+    if not team_raised:
+        return reader
+    reader = f"{reader}:raised:{raised_by}"
+    departments = sorted({t.split(":", 1)[1] for t in tags if t.startswith("department:")})
+    return f"{reader}:departments:{','.join(departments)}" if departments and not routed else reader
 
 
-def reader_for(person_id: int | None, *, private: bool) -> str:
-    """The reader key of a card for ``person_id`` (None: the team)."""
+def _card_reader(row: Any, tags: list[str]) -> str:
+    """The reader key of card ``row``."""
+    from openexecutive.alerts.models import TEAM_RAISED_SOURCE
+
+    return _reader(
+        row.routed_to_person_id, tags, raised_by=row.owner_person_id, team_raised=row.source == TEAM_RAISED_SOURCE,
+    )
+
+
+def reader_for(
+    person_id: int | None, *, private: bool, raised_by: int | None = None, team_raised: bool = False,
+    department: str | None = None,
+) -> str:
+    """The reader key of a card for ``person_id`` (None: the team), the
+    same as the card's own once it is written (``_card_reader``):
+    ``department`` is the routing hint the pipeline turns into its tag."""
     from openexecutive.alerts.models import PRIVATE_ALERT_TAG
+    from openexecutive.alerts.pipeline import _with_department_tag
 
-    return _reader(person_id, [PRIVATE_ALERT_TAG] if private else [])
+    tags = _with_department_tag([PRIVATE_ALERT_TAG] if private else [], department)
+    return _reader(person_id, tags, raised_by=raised_by, team_raised=team_raised)
 
 
 # --------------------------------------------------------------------------- #
@@ -417,12 +444,31 @@ def _join(conn: sqlite3.Connection, card: _Card, into: _Card) -> None:
         "last_seen_at = ?, status = CASE WHEN status = 'read' THEN 'unread' ELSE status END WHERE id = ?",
         (body, severity, _now(), into.id),
     )
-    if not into.approve and card.needs in ("answer", "choice") and str(survivor["needs"] or "") not in ("answer", "choice"):
-        # The card that stays asks what the joining one asked.
-        ask = conn.execute("SELECT needs, question, choices FROM alerts WHERE id = ?", (card.id,)).fetchone()
+    # Two cards from one turn are often two asks, not a newer version of
+    # one: there the card that stays keeps its own title and plan, and takes
+    # the question only when it asks none itself.
+    same_turn = bool(card.turn) and card.turn == into.turn
+    if not into.approve and card.needs in ("answer", "choice") and same_turn:
+        if str(survivor["needs"] or "") not in ("answer", "choice"):
+            ask = conn.execute("SELECT needs, question, choices FROM alerts WHERE id = ?", (card.id,)).fetchone()
+            conn.execute(
+                "UPDATE alerts SET needs = ?, question = ?, choices = ? WHERE id = ?",
+                (ask["needs"], ask["question"], ask["choices"], into.id),
+            )
+    elif not into.approve and card.needs in ("answer", "choice"):
+        # The joining card is newer and asks something: the matter as it
+        # stands now. Its title, plan and question lead, and what came
+        # before stays above "Then:" (a contact's new times sat under their
+        # old ones, and the card asked about the old ones).
+        newer = conn.execute(
+            "SELECT headline, suggested_action, needs, question, choices FROM alerts WHERE id = ?", (card.id,),
+        ).fetchone()
         conn.execute(
-            "UPDATE alerts SET needs = ?, question = ?, choices = ? WHERE id = ?",
-            (ask["needs"], ask["question"], ask["choices"], into.id),
+            "UPDATE alerts SET headline = COALESCE(NULLIF(?, ''), headline), "
+            "suggested_action = COALESCE(NULLIF(?, ''), suggested_action), needs = ?, question = ?, choices = ? "
+            "WHERE id = ?",
+            (newer["headline"], newer["suggested_action"], newer["needs"], newer["question"], newer["choices"],
+             into.id),
         )
     _close(conn, card.id, into.id)
 
@@ -529,7 +575,7 @@ def _place(alert_id: int, db_path: Path | None) -> int:
             "INSERT OR REPLACE INTO card_topics (alert_id, reader, person, turn, thread, step, decision_id, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                alert_id, _reader(row.routed_to_person_id, tags), person_key(session),
+                alert_id, _card_reader(row, tags), person_key(session),
                 "" if given.get("own_words") else _turn_id(),
                 _conversation(conn, str(given.get("thread") or "") or _turn_thread(session)),
                 str(given.get("step") or ""),

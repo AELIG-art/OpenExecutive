@@ -48,13 +48,13 @@ def mail_turn() -> Iterator[Session]:
 
 def _note(
     headline: str, *, reader: int | None = OWNER, private: bool = False, source: str = "email",
-    raised: bool = True, joins: int | None = None, severity: str = "medium", **kw: Any,
+    raised: bool = True, joins: int | None = None, severity: str = "medium", tags: tuple[str, ...] = (), **kw: Any,
 ) -> int:
     with one_card.about(raised=raised, joins=joins):
         alert_id = alerts_store.insert_alert(
             source=source, external_id=f"{headline}-{id(kw)}", severity=severity, headline=headline,
             body=kw.pop("body", headline), routed_to_person_id=reader,
-            topic_tags=[PRIVATE_ALERT_TAG] if private else [], **kw,
+            topic_tags=[*([PRIVATE_ALERT_TAG] if private else []), *tags], **kw,
         )
     assert alert_id is not None
     return alert_id
@@ -435,3 +435,121 @@ def test_a_newer_reply_takes_each_follow_up_once_and_stays_within_the_cap(mail_t
     assert len(body) <= _FOLLOW_UP_MAX
     follow_ups = body.split("\n\nThen: ")[1:]
     assert follow_ups and len(follow_ups) == len(set(follow_ups))
+
+
+def test_a_newer_card_on_the_same_matter_says_where_it_stands_now(mail_turn: Session) -> None:
+    """A contact's new request joined their old card, whose title and
+    choices stayed the old times. The newer card's title, plan and question
+    lead; the old words stay above its own."""
+    with set_turn(session_id="s", turn_id="turn-1"):
+        first = _note(
+            "Sam asks to move Nov 24 to Dec 2 or 3", body="Sam offers Dec 2 or Dec 3.",
+            suggested_action="Confirm Dec 2", needs="choice", question="Dec 2 or Dec 3?", choices=["Dec 2", "Dec 3"],
+        )
+    with set_turn(session_id="s", turn_id="turn-2"):
+        newer = _note(
+            "Sam now offers Dec 1 or Dec 2", body="Sam can't make Nov 24 and offers Dec 1 or Dec 2.",
+            suggested_action="Reply proposing Dec 1", needs="choice", question="Dec 1 or Dec 2?",
+            choices=["Dec 1", "Dec 2"],
+        )
+    assert _get(newer).superseded_by_alert_id == first
+    kept = _get(first)
+    assert kept.headline == "Sam now offers Dec 1 or Dec 2" and kept.suggested_action == "Reply proposing Dec 1"
+    assert kept.question == "Dec 1 or Dec 2?" and kept.choices == ["Dec 1", "Dec 2"]
+    assert kept.body.startswith("Sam offers Dec 2 or Dec 3.") and "Then: " in kept.body
+    # A card that only tells adds its words and leaves the rest.
+    with set_turn(session_id="s", turn_id="turn-3"):
+        _note("Sam is still waiting")
+    assert _get(first).question == "Dec 1 or Dec 2?" and _get(first).headline == "Sam now offers Dec 1 or Dec 2"
+
+
+def test_a_team_members_card_joins_only_another_of_theirs() -> None:
+    """A teammate's card is read by them and whom it is for: joining a card
+    everyone reads would show their ask to the whole team, and joining another teammate's would hide it from them."""
+    from openexecutive.alerts.models import TEAM_RAISED_SOURCE
+
+    with set_turn(session_id="s", turn_id="turn-1"):
+        team = _note("Owner's own card")
+        theirs = _note("Dana asks for the FedEx deadline", source=TEAM_RAISED_SOURCE, owner_person_id=7)
+        sams = _note("Sam asks for the UPS deadline", source=TEAM_RAISED_SOURCE, owner_person_id=8)
+        again = _note("Dana asks again", source=TEAM_RAISED_SOURCE, owner_person_id=7)
+    assert _get(theirs).status == "unread" and _get(theirs).superseded_by_alert_id is None
+    assert _get(sams).status == "unread" and _get(team).status == "unread"
+    assert _get(again).superseded_by_alert_id == theirs
+
+
+def test_a_team_member_is_asked_about_their_own_open_card() -> None:
+    """The key create_alert asks with (``reader_for``) is the card's own, so
+    a teammate's next card on the matter is asked whether it joins theirs."""
+    from openexecutive.alerts.models import TEAM_RAISED_SOURCE
+
+    token = current_session.set(Session(caller_person_id=7))
+    try:
+        with set_turn(session_id="s", turn_id="turn-1"):
+            theirs = _note("Dana asks for the FedEx deadline", source=TEAM_RAISED_SOURCE, owner_person_id=7)
+        dana = one_card.reader_for(OWNER, private=False, raised_by=7, team_raised=True)
+        sam = one_card.reader_for(OWNER, private=False, raised_by=8, team_raised=True)
+        assert [cid for cid, _, _ in one_card.open_cards_from("person:7", turn="turn-2", reader=dana)] == [theirs]
+        assert one_card.open_cards_from("person:7", turn="turn-2", reader=sam) == []
+        owners = one_card.reader_for(OWNER, private=False)
+        assert one_card.open_cards_from("person:7", turn="turn-2", reader=owners) == []
+    finally:
+        current_session.reset(token)
+
+
+def test_a_team_members_cards_for_two_departments_stay_apart() -> None:
+    """Unrouted, a teammate's card is for its department's people: joined
+    into another department's card, its ask would reach neither."""
+    from openexecutive.alerts.models import TEAM_RAISED_SOURCE
+
+    with set_turn(session_id="s", turn_id="turn-1"):
+        finance = _note("Dana asks finance", reader=None, source=TEAM_RAISED_SOURCE, owner_person_id=7,
+                        tags=("department:finance",))
+        sales = _note("Dana asks sales", reader=None, source=TEAM_RAISED_SOURCE, owner_person_id=7,
+                      tags=("department:sales",))
+        again = _note("Dana asks finance again", reader=None, source=TEAM_RAISED_SOURCE, owner_person_id=7,
+                      tags=("department:finance",))
+    assert _get(sales).superseded_by_alert_id is None and _get(sales).status == "unread"
+    assert _get(again).superseded_by_alert_id == finance
+
+
+def test_two_questions_from_one_turn_keep_the_first_ones_question() -> None:
+    """Two asks in one turn are two questions, not a newer version of one:
+    the card that stays keeps its own question and choices."""
+    with set_turn(session_id="s", turn_id="turn-1"):
+        budget = _note("Approve the Q1 budget?", needs="choice", question="Approve it?", choices=["Yes", "No"])
+        vendor = _note("Which vendor?", needs="choice", question="A or B?", choices=["A", "B"])
+    kept = _get(budget)
+    assert _get(vendor).superseded_by_alert_id == budget
+    assert kept.headline == "Approve the Q1 budget?" and kept.question == "Approve it?"
+    assert kept.choices == ["Yes", "No"] and "Which vendor?" in kept.body
+
+
+def test_create_alert_asks_with_the_key_a_teammates_card_is_written_with() -> None:
+    """The key ``create_alert`` looks for open cards with (``_reader_of``)
+    is the one the card it raises is stored under, department and all."""
+    import sqlite3
+
+    from openexecutive.alerts.models import TEAM_RAISED_SOURCE, AlertEvent
+    from openexecutive.orchestrator.alert_tools import _reader_of
+
+    with set_turn(session_id="s", turn_id="turn-1"):
+        card = _note("Dana asks finance", reader=None, source=TEAM_RAISED_SOURCE, owner_person_id=7,
+                     tags=("department:finance",))
+    with sqlite3.connect(str(episodic.DB_PATH)) as conn:
+        stored = conn.execute("SELECT reader FROM card_topics WHERE alert_id = ?", (card,)).fetchone()[0]
+    event = AlertEvent(source=TEAM_RAISED_SOURCE, external_id="x", raised_by_person_id=7, channel="department:finance")
+    assert _reader_of(event) == stored
+    sams = AlertEvent(source=TEAM_RAISED_SOURCE, external_id="x", raised_by_person_id=8, channel="department:finance")
+    assert _reader_of(sams) != stored
+
+
+def test_a_question_from_the_same_turn_keeps_the_reports_title() -> None:
+    """A report and a question in one turn: the card keeps the report's
+    title and plan, and asks the question."""
+    with set_turn(session_id="s", turn_id="turn-1"):
+        report = _note("Q3 revenue down 12%", suggested_action="Review the forecast")
+        _note("Approve the hiring freeze?", needs="choice", question="Freeze?", choices=["Yes", "No"])
+    kept = _get(report)
+    assert kept.headline == "Q3 revenue down 12%" and kept.suggested_action == "Review the forecast"
+    assert kept.question == "Freeze?" and kept.choices == ["Yes", "No"]
