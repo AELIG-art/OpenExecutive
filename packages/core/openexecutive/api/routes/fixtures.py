@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-router = APIRouter()
+
+def _principal_writes(request: Request) -> Iterator[None]:
+    """Every write here replaces or wipes the whole company: the principal's
+    (``chat.principal_writes``)."""
+    from openexecutive.api.routes.chat import principal_writes
+
+    yield from principal_writes(request)
+
+
+router = APIRouter(dependencies=[Depends(_principal_writes)])
 
 _SAFE_NAME = re.compile(r"^[a-z0-9_-]+$")
 

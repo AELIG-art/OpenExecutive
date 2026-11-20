@@ -102,22 +102,13 @@ def _parse_pages(raw: str) -> tuple[int, int] | str:
 
 async def _read_pages(path: Path, first: int, last: int) -> tuple[Any, str]:
     """Read pages ``[first, last)`` of a PDF. Returns ``(result, range_label)``."""
-    from pypdf import PdfReader
-
-    from openexecutive.knowledge.pdf_reader import read_pdf_text, slice_pdf
+    from openexecutive.knowledge.pdf_reader import page_range, read_pdf_text
 
     data = await asyncio.to_thread(path.read_bytes)
-
-    def _count() -> int:
-        import io
-
-        return len(PdfReader(io.BytesIO(data)).pages)
-
-    total = await asyncio.to_thread(_count)
-    if first >= total:
+    total, part = await page_range(data, first, last)
+    if part is None:
         raise ValueError(f"that PDF has only {total} pages")
     last = min(last, total)
-    part = await asyncio.to_thread(slice_pdf, data, first, last)
     result = await read_pdf_text(part, filename=path.name)
     return result, f"pages {first + 1}-{last} of {total}"
 
@@ -171,6 +162,7 @@ async def _read_handle(tool_input: dict[str, Any]) -> str:
 
 
 async def _read_path(resolved: Path, tool_input: dict[str, Any]) -> str:
+    from openexecutive.knowledge.isolated import ParserBusy
     from openexecutive.knowledge.loader import read_document_text
     from openexecutive.providers.registry import reading_limits_for
 
@@ -189,6 +181,8 @@ async def _read_path(resolved: Path, tool_input: dict[str, Any]) -> str:
             result = await read_document_text(resolved)
     except ValueError as exc:
         return _err(str(exc))
+    except ParserBusy:
+        return _err("the document reader is busy right now; try again in a minute")
     except Exception as exc:
         logger.warning("read_document: extraction failed (%s)", type(exc).__name__)
         return _err("could not read that file")

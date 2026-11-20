@@ -116,6 +116,7 @@ RESET_KEEPS: frozenset[str] = frozenset({
     "generated_fixtures",
     "executive_control",
     "eval_scenarios",
+    "install_owner",  # who runs the install, whichever company is live
 })
 
 # Walk up from this file to find the repo root (contains evals/, fixtures/, etc.)
@@ -772,7 +773,8 @@ async def reset_all_state(
       3. Empty every table in the company DB except ``RESET_KEEPS`` and
          ``keep``: chats, memory, run and audit history, people, departments
          and Goals (none are re-created), the whole job queue, and any
-         table added later
+         table added later. The principal's own People row is written back
+         (``_restore_principal``), so the company keeps its owner
       5a. Reset the workspace settings to the defaults (team, no zone),
           then seed every recurring job again (``seed_recurring_jobs``) —
           without this Today stays blank until the next API restart
@@ -784,6 +786,13 @@ async def reset_all_state(
     from openexecutive.memory.company_profile import CompanyProfile
 
     async with _FIXTURE_OP_LOCK:
+        # The principal stays: a reset empties the company, not its owner.
+        # With no principal left, the first signed-in person to ask would be
+        # let set themselves up as the owner (``chat._caller_is_principal_or_unclaimed``
+        # is for a brand-new install only). Read first, so a roster that
+        # can't be read stops the reset before anything is wiped.
+        owner = _principal_to_keep(keep, settings)
+
         # 1. Live profile → empty
         CompanyProfile().save_to_yaml(settings.company_profile_path)
 
@@ -860,6 +869,7 @@ async def reset_all_state(
         from openexecutive.memory.episodic import DB_PATH as EPISODIC_DB_PATH
         from openexecutive.people import store as people_store
 
+
         cleared: dict[str, int] = {}
         for db_path in dict.fromkeys(
             p.resolve() for p in (EPISODIC_DB_PATH, people_store.DB_PATH, dept_store.DB_PATH)
@@ -869,6 +879,14 @@ async def reset_all_state(
         # Right away, so nothing read during the rest of the reset (or after
         # a later step fails) serves the rows just deleted.
         forget_company_caches()
+        if owner is not None:
+            try:
+                _restore_principal(owner)
+            except Exception:
+                # The rest of the reset still runs; the roster is left with
+                # no principal (see ``_restore_principal``).
+                logger.exception("reset: couldn't write the principal back")
+            forget_company_caches()
 
         # 3c. Knowledge review state (same DB as the episodic rows above). A
         # "factory reset" that keeps the previous operator's approvals,
@@ -1042,6 +1060,58 @@ _SHADOW_TABLE_PARTS = (
     "config", "content", "data", "docsize", "idx", "segdir", "segments",
     "stat", "node", "parent", "rowid",
 )
+
+
+def _principal_to_keep(keep: Collection[str], settings: Any) -> Any:
+    """The principal's People row to write back after the sweep, or None
+    when the caller keeps the people table anyway, there is no principal, or
+    a simulator company or a client is live (its principal is that
+    company's, not the install owner's). With the owner's own company live,
+    its principal is kept as the install's owner too, so a handover on the
+    People page is what the reset keeps. Raises when the roster can't be
+    read: a reset must not drop an owner it could not see."""
+    if "people" in keep:
+        return None
+    from openexecutive.clients.slots import get_active_client
+    from openexecutive.people import install_owner
+    from openexecutive.people import store as people_store
+
+    # Read directly, not through ``install_owner.away_from_own_company``,
+    # which reads an error as away: here that would drop the owner, so an
+    # error aborts the reset instead.
+    if _fixture_active_sentinel(settings).exists() or get_active_client(settings) is not None:
+        # Only the kept owner may set the company up again
+        # (``chat._caller_is_principal_or_unclaimed``).
+        return None
+    principal = people_store.find_principal_person()
+    if principal is not None and principal.email:
+        install_owner.remember(principal.email)
+    return principal
+
+
+def _restore_principal(owner: Any) -> None:
+    """Write ``owner`` back as the principal: name, role, sign-in address,
+    the other addresses they write from and the chat accounts the Executive
+    reaches them on. Nothing else of the old company comes back: not their
+    departments, channel preference, reply time or authority. Should this
+    fail with the roster already empty, the install's kept owner
+    (``people.install_owner``) is still the only one who may set it up."""
+    from openexecutive.people import store as people_store
+
+    person_id = people_store.upsert_person(
+        full_name=owner.full_name,
+        role=owner.role,
+        is_principal=True,
+        email=owner.email,
+        slack_user_id=owner.slack_user_id,
+        telegram_chat_id=owner.telegram_chat_id,
+        discord_user_id=owner.discord_user_id,
+    )
+    for alias in owner.email_aliases:
+        try:
+            people_store.add_person_email(person_id, alias)
+        except ValueError:
+            logger.warning("reset: couldn't keep one of the principal's other addresses", exc_info=True)
 
 
 def _delete_every_table(db_path: Path, *, keep: Collection[str]) -> dict[str, int]:

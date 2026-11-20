@@ -7,7 +7,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from types import SimpleNamespace
 from typing import Any, Literal, NamedTuple
 
@@ -1042,15 +1042,82 @@ def _caller_is_principal_or_unclaimed(request: Request) -> bool:
     names no one, so it can't set up an install it doesn't own. Fails closed:
     if the roster cannot be read, the answer is no.
     """
+    from openexecutive.people import install_owner
     from openexecutive.people import store as people_store
 
     try:
+        who = api_caller.caller(request)
         if people_store.find_principal_person() is None:
-            return api_caller.caller(request).kind != "service"
+            # Unclaimed only on an install nobody has owned yet: once an owner
+            # is kept (``people.install_owner``), only they may set it up again.
+            owner = install_owner.get()
+            if owner is not None:
+                return who.defaults_to_principal or who.email == owner
+            return who.kind != "service"
+        if install_owner.away_from_own_company():
+            # A simulator company or a client is live, with its own principal:
+            # the install's owner still runs it and can switch back.
+            owner = install_owner.get() or install_owner.from_own_company_copy()
+            if owner is not None and who.email == owner:
+                return True
         return people_store.is_principal_or_self(_resolve_caller_person_id(request), None)
     except Exception:
         logger.exception("principal check failed — refusing the principal-only change")
         return False
+
+
+_READS = frozenset({"GET", "HEAD", "OPTIONS"})
+# The writes that replace the whole company: on an install with no principal
+# yet, whoever makes one is kept as its owner (``_install_owner_to_keep``).
+_SETS_UP = ("/reset", "/load", "/activate")
+
+
+def principal_writes(request: Request) -> Iterator[None]:
+    """Router dependency for routes whose writes replace or wipe the whole
+    company (the company simulator, client slots): a reset, a load, a switch
+    and the backup are the principal's, as the workspace settings and the
+    People list are (``_caller_is_principal_or_unclaimed``). Reads stay open.
+    The install's owner is kept once the write has gone through, never on
+    one that failed."""
+    if request.method in _READS:
+        yield
+        return
+    if not _caller_is_principal_or_unclaimed(request):
+        raise HTTPException(status_code=403, detail="Only the principal can change the company's saved data")
+    owner = _install_owner_to_keep(request)
+    yield
+    if owner:
+        from openexecutive.people import install_owner
+
+        try:
+            install_owner.remember(owner)
+        except Exception:
+            logger.warning("couldn't keep the install's owner", exc_info=True)
+
+
+def _install_owner_to_keep(request: Request) -> str | None:
+    """The address to keep as the install's owner once this write goes
+    through: the principal's, signed in as themselves, while their own
+    company is live, or on a roster with no principal yet the address of
+    whoever replaces the company (a reset, a load, a switch), not an
+    incidental write. With it kept, loading a simulator company or a client
+    can't lock them out of switching back (``people.install_owner``).
+    Never raises."""
+    from openexecutive.people import install_owner
+    from openexecutive.people import store as people_store
+
+    try:
+        email = api_caller.caller(request).email
+        principal = people_store.find_principal_person()
+        if principal is None:
+            mine = request.url.path.rstrip("/").endswith(_SETS_UP)
+        else:
+            mine = (principal.email or "").strip().lower() == email
+        if email and mine and not install_owner.away_from_own_company():
+            return email
+    except Exception:
+        logger.warning("couldn't tell the install's owner", exc_info=True)
+    return None
 
 
 async def _run_chat_turn(
