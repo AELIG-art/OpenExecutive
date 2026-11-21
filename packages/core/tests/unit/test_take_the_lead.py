@@ -1312,6 +1312,103 @@ def test_approve_and_allow(client: TestClient, owner: Any, monkeypatch: pytest.M
     assert learned["label"] == "Message Sam Teammate" and learned["example"] == {}
 
 
+def test_the_tick_is_kept_when_the_step_fails(client: TestClient, owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An app turning the step down doesn't make them teach it again: the
+    tick is about the kind of step, not this one call."""
+    async def carry_out(payload: dict[str, Any], *, by_principal: bool, own_card: bool = False) -> str:
+        return json.dumps({"error": "Artifact 'alert:7' not found"})
+
+    monkeypatch.setattr(ttl, "carry_out", carry_out)
+    decision_id, _ = _training_card(owner)
+    response = client.post(f"/decisions/{decision_id}/approve", json={"edits": {"allow": True}})
+    assert response.status_code == 502, response.text
+    [learned] = client.get("/take-the-lead").json()["learned"]
+    assert learned["label"] == "Message Sam Teammate"
+
+
+def test_the_tick_is_kept_when_the_step_raises(client: TestClient, owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """However the one call ended, a crash included, the tick stays."""
+    async def carry_out(payload: dict[str, Any], *, by_principal: bool, own_card: bool = False) -> str:
+        raise RuntimeError("the connection dropped")
+
+    monkeypatch.setattr(ttl, "carry_out", carry_out)
+    decision_id, _ = _training_card(owner)
+    response = client.post(f"/decisions/{decision_id}/approve", json={"edits": {"allow": True}})
+    assert response.status_code == 502, response.text
+    [learned] = client.get("/take-the-lead").json()["learned"]
+    assert learned["label"] == "Message Sam Teammate"
+
+
+def test_a_department_card_carries_documents_only_for_its_own_approver(owner: Any) -> None:
+    """A department head's own request held on their own list carries their
+    documents; one held for someone else's approval carries none."""
+    from openexecutive.orchestrator import artifact_records, department_gate
+
+    sam = _teammate()
+    person = people_store.get_person(sam)
+    assert person is not None
+
+    def held(approver: int | None, text: str) -> dict[str, Any]:
+        verdict = department_gate.Verdict(run=False, department="sales", level="propose",
+                                          approver_person_id=approver, reason="it waits")
+        with artifact_records.pinned_viewer(artifact_records.viewer_for_person(sam)):
+            decision_id = department_gate.hold(person, "message_person", {"person_id": sam, "text": text},
+                                               verdict, mcp=False)
+        instance = ledger.get_decision_instance(decision_id)
+        assert instance is not None
+        return dict(json.loads(instance.proposed_payload_json))
+
+    assert held(sam, "Thursday?")["documents_of"] == sam
+    assert "documents_of" not in held(artifact_records.principal_viewer().person_id, "Friday?")
+
+
+def test_a_held_step_runs_with_the_documents_of_its_turn(owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The card records whose documents its turn read when the card is
+    theirs, and the approved step reads the same person's, so an email
+    attaching their document finds it. Someone else's card never carries
+    them: the step then reads nobody's."""
+    from openexecutive.orchestrator import artifact_records
+    from openexecutive.orchestrator.executive import _ALL_SKILL_HANDLERS
+
+    sam = _teammate()
+    seen: list[Any] = []
+
+    async def handler(tool_input: dict[str, Any]) -> str:
+        seen.append(artifact_records.current_viewer())
+        return json.dumps({"status": "sent"})
+
+    monkeypatch.setitem(_ALL_SKILL_HANDLERS, "message_person", handler)
+
+    def held_as(viewer: Any, text: str) -> dict[str, Any]:
+        with artifact_records.pinned_viewer(viewer):
+            decision_id = ttl.hold("message_person", {"person_id": sam, "text": text},
+                                   ttl.Hit("level", "it waits"), source="reflection", mcp=False)
+        instance = ledger.get_decision_instance(decision_id)
+        assert instance is not None
+        return dict(json.loads(instance.proposed_payload_json))
+
+    principal = artifact_records.principal_viewer()
+    mine = held_as(principal, "Thursday?")
+    assert mine["documents_of"] == principal.person_id
+    asyncio.run(ttl.carry_out({**mine, "tapped_by": principal.person_id}, by_principal=True))
+    assert seen[-1] == principal
+    # Their documents open only for their own tap: anyone else approving a
+    # card that carries them reads nobody's.
+    asyncio.run(ttl.carry_out({**mine, "documents_of": sam, "tapped_by": principal.person_id}, by_principal=True))
+    assert seen[-1] == artifact_records.NOBODY
+    asyncio.run(ttl.carry_out(mine, by_principal=True))
+    assert seen[-1] == artifact_records.NOBODY
+    # Sam's work whose card lands on the owner's list: the tap doesn't open
+    # Sam's documents.
+    theirs = held_as(artifact_records.viewer_for_person(sam), "Friday?")
+    assert "documents_of" not in theirs
+    asyncio.run(ttl.carry_out(theirs, by_principal=True))
+    assert seen[-1] == artifact_records.NOBODY
+    # Nor does naming Sam as the asker on a card someone else approves.
+    asyncio.run(ttl.carry_out({**theirs, "requested_by_person_id": sam}, by_principal=True))
+    assert seen[-1] == artifact_records.NOBODY
+
+
 def test_edit_then_do_it_like_this(client: TestClient, owner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     done: list[dict[str, Any]] = []
     _carry_out_into(done, monkeypatch)
