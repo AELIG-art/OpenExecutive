@@ -187,6 +187,8 @@ class OpenAICompatibleProvider:
         slugs never carry a per-call ``reasoning`` object (their spec has
         ``supports_thinking=False``), so there is nothing for it to clash
         with."""
+        if slug == "gpt-6-luna" and "max_tokens" in body:
+            body["max_completion_tokens"] = body.pop("max_tokens")
         if self._reasoning_effort:
             body["reasoning_effort"] = self._reasoning_effort
             _announce_effort(slug, self._reasoning_effort)
